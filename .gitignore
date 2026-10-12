@@ -4,3 +4,4 @@ dist/
 *.vsix
 .agents/
 .codex/
+.workbuddy/
