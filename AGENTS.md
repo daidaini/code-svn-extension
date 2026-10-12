@@ -14,3 +14,8 @@
 
 采用 single-context 布局。
 探索或修改项目前阅读 docs/agents/domain.md。
+
+### Code review
+
+代码审查默认使用可用的 Codex CLI，以只读方式分别执行 Standards 与 Spec 双轴审查。
+CLI 不可用或启动失败时报告阻塞，等待用户决定执行方式。

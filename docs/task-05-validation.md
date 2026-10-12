@@ -41,20 +41,36 @@
 其中任务 01–04 回归 39 项、任务 05 新增 8 项。完整日志位于本地忽略目录
 `.test-artifacts/task-05-full-tests.log`。
 
-## 独立审查阻塞
+## Codex CLI 双轴审查
 
-Standards 与 Spec 双轴审查已按 `code-review` 发起，但两个 reviewer 均未能启动，
-因此没有审查结论，不把启动失败记为审查通过。
+用户明确授权此次及后续项目审查使用 Codex CLI，已在根目录 `AGENTS.md` 记录。
+审查对象为 `main` 分支 `739076abc1e7b8404de892fa0cefa5196e46f061`，
+基准为本文开头的提交。两路审查分别启动独立只读 CLI 进程，不修改源码，
+没有放宽沙箱权限，也没有修改永久模型配置。
 
-工作流：`fc471651-2149-4a1c-b220-fba4b568f5f0`，最终状态已结束，两项子任务失败。
-子运行：Standards `0543d6ae-6d03-45bd-a570-56ce7913db10`；
-Spec `395f3575-657e-4249-8d76-f9c0e1050774`。
-失败原因：后台子代理要求宿主 npm 包及其依赖，但当前安装
-`C:\Users\admin\.bun\install\global\node_modules\@earendil-works\pi-coding-agent`
-未提供 `@earendil-works/pi-agent-core/node`。
+CLI 为 `codex-cli 0.155.1`，登录方式为 ChatGPT。默认配置模型 `gpt-6.1-sol`
+被服务端拒绝；核对本机模型缓存后，仅本次调用显式指定 `gpt-6-sol`。
 
-审查目标为本仓库 `main` 分支的任务 05 提交，未使用工作树隔离，也未修改源码。
-没有持久化子会话，不能恢复该子会话。待用户修复运行环境，或明确授权其他审查执行方式后再继续。
+### Standards
+
+尚未获得审查结论。服务端返回 `Selected model is at capacity. Please try a different model.`，
+单独使用同一模型重试一次仍失败。该轴不能记为通过或零问题。
+本地失败日志：`.test-artifacts/task05-codex-standards-final.jsonl`。
+
+### Spec
+
+只读 Codex 审查正常结束，退出码 0，发现 0 项需求缺失、范围扩张或错误实现。
+报告核对了添加与选择分离、管理范围及父目录依赖检查、共享依赖重算与展示、
+显式非递归提交目标及失败时保留选择和输入。报告没有重跑测试，使用上述测试记录作为既有证据。
+结论：Spec 轴通过；不据此替代 Standards 轴。
+本地原始报告：`.test-artifacts/task05-codex-spec-retry.md`。
+
+### 先前调度阻塞
+
+原生 reviewer 工作流 `fc471651-2149-4a1c-b220-fba4b568f5f0` 的两个子代理均未启动。
+改用 Codex 配置的 Pi 工作流 `c48ae884-70f0-4a74-949f-a8b98dc62520` 也在 CLI 启动前失败。
+共同原因是 Pi 后台调度要求当前宿主未导出的 `@earendil-works/pi-agent-core/node`。
+这两次启动失败没有产生审查结论。用户授权后改为直接执行 Codex CLI，未修改 Pi 安装。
 
 ## 尚未验证
 
