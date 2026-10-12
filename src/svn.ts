@@ -1,6 +1,7 @@
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
+import * as os from 'node:os';
 import { XMLParser, XMLValidator } from 'fast-xml-parser';
 
 export interface Change {
@@ -244,4 +245,42 @@ export async function readDifference(executable: string, folder: string, change:
     return mime !== undefined && !mime.startsWith('text/') && !['image/x-xbitmap', 'image/x-xpixmap'].includes(mime);
   });
   return { ...content, binary: content.binary || binaryMime, properties: changes };
+}
+
+export async function commitFiles(executable: string, root: string, targets: string[], message: string): Promise<number> {
+  if (targets.length === 0) throw new Error('没有待提交文件。');
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'code-svn-commit-'));
+  const messageFile = path.join(directory, 'message.txt');
+  try {
+    await fs.writeFile(messageFile, message, 'utf8');
+    // Translate messages without changing the caller's effective character
+    // encoding, which Unix SVN uses to interpret filenames.
+    const environment = { ...process.env };
+    if (environment.LC_ALL) environment.LC_CTYPE = environment.LC_ALL;
+    delete environment.LC_ALL;
+    environment.LC_MESSAGES = 'C';
+    return await new Promise<number>((resolve, reject) => {
+      // A commit must not be timed out, cancelled or retried: its remote result
+      // could already exist. spawn also avoids execFile's maxBuffer kill limit.
+      const child = spawn(executable, ['commit', '--non-interactive', '--depth', 'empty',
+        '--encoding', 'UTF-8', '--file', messageFile, '--',
+        ...targets.map(target => `${path.relative(root, target)}@`)], {
+        cwd: root, windowsHide: true, env: environment
+      });
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', chunk => { stdout += chunk.toString('utf8'); });
+      child.stderr.on('data', chunk => { stderr += chunk.toString('utf8'); });
+      child.on('error', error => reject(new Error(`SVN 提交失败：${error.message}`)));
+      child.on('close', code => {
+        const revision = /(?:^|\r?\n)Committed revision (\d+)\./.exec(stdout);
+        if (code !== 0) reject(new Error(`SVN 提交失败：${stderr.trim() || `退出码 ${code}`}`));
+        else if (!revision) reject(new Error('SVN 未确认产生修订，不能视为提交成功。请刷新并检查仓库结果后再决定是否提交。'));
+        else resolve(Number(revision[1]));
+      });
+    });
+  } finally {
+    await fs.unlink(messageFile).catch(() => undefined);
+    await fs.rmdir(directory).catch(() => undefined);
+  }
 }

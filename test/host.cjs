@@ -45,6 +45,7 @@ async function host(root, folder, settings = {}) {
     'workbench.startupEditor': 'none',
     'workbench.enableExperiments': false,
     'update.mode': 'none',
+    'window.dialogStyle': 'custom',
     'git.enabled': false,
     'scm.defaultViewMode': 'list',
     'scm.alwaysShowRepositories': false,
@@ -85,13 +86,40 @@ async function host(root, folder, settings = {}) {
         const current = JSON.parse(await fs.readFile(file, 'utf8'));
         await fs.writeFile(file, JSON.stringify({ ...current, ...values }));
       },
-      async command(title) {
+      async command(title, waitForClose = true) {
         await page.keyboard.press('F1');
         const input = page.locator('.quick-input-widget input').first();
         await input.fill(`>${title}`);
         await page.locator('.quick-input-list .monaco-list-row').filter({ hasText: title }).first().waitFor();
         await page.keyboard.press('Enter');
+        if (waitForClose) await input.waitFor({ state: 'hidden' });
+      },
+      async chooseChange(title, name) {
+        await this.command(title, false);
+        await page.locator('.quick-input-list .monaco-list-row').filter({ hasText: name }).first().click();
+        await page.locator('.quick-input-widget input').first().waitFor({ state: 'hidden' });
+      },
+      async commitMessage(message, index = 0) {
+        await page.keyboard.press('Control+Shift+G');
+        const input = page.locator('.scm-view .scm-input .monaco-editor').nth(index);
+        await input.click({ position: { x: 30, y: 15 } });
+        await page.keyboard.press('Control+A');
+        await page.keyboard.insertText(message);
+      },
+      async commitMessageText(index = 0) {
+        return (await page.locator('.scm-view .scm-input').nth(index).locator('.view-lines').allInnerTexts()).join('\n').replace(/\u00a0/g, ' ');
+      },
+      async editFile(target, text) {
+        await page.keyboard.press('Control+P');
+        const input = page.locator('.quick-input-widget input').first();
+        await input.fill(target);
+        await page.locator('.quick-input-list .monaco-list-row').filter({ hasText: path.basename(target) }).first().waitFor();
+        await page.keyboard.press('Enter');
         await input.waitFor({ state: 'hidden' });
+        const editor = page.locator('.editor-group-container.active .monaco-editor').first();
+        await editor.click({ position: { x: 70, y: 15 } });
+        await page.keyboard.press('Control+A');
+        await page.keyboard.insertText(text);
       },
       async scmText() {
         await page.keyboard.press('Control+Shift+G');

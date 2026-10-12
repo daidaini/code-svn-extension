@@ -1,7 +1,8 @@
 import * as vscode from 'vscode';
 import * as path from 'node:path';
+import { CommitSelection, WorkingCopyWrites, pathKey, within } from './commit-selection';
 import {
-  Change, PropertyChange, PropertyValue, readChanges, readDifference, readWorkingContent, WorkingCopyQueryError
+  Change, PropertyChange, PropertyValue, commitFiles, readChanges, readDifference, readWorkingContent, WorkingCopyQueryError
 } from './svn';
 
 // Local and base content reach the diff editor through this scheme so a deleted
@@ -18,16 +19,6 @@ function label(change: Change): string {
   if (['normal', 'none'].includes(change.item)) return '属性已修改';
   const text = labels[change.item] ?? `SVN 状态：${change.item}`;
   return change.props === 'modified' ? `${text}（含属性）` : text;
-}
-
-function pathKey(value: string): string {
-  const normalized = path.normalize(value);
-  return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
-}
-
-function within(folder: string, target: string): boolean {
-  const relative = path.relative(pathKey(folder), pathKey(target));
-  return relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
 }
 
 function sideUri(target: string, side: 'base' | 'working' | 'properties'): vscode.Uri {
@@ -52,6 +43,7 @@ interface WorkingCopyView {
   groups: Map<string, vscode.SourceControlResourceGroup>;
   changes: Change[];
   lastError: string;
+  selected: CommitSelection;
 }
 
 interface WorkingCopyResult {
@@ -64,18 +56,18 @@ interface WorkingCopyResult {
 function showChanges(view: WorkingCopyView, changes: Change[]): void {
   const byLabel = new Map<string, vscode.SourceControlResourceState[]>();
   for (const change of changes) {
-    const name = label(change);
+    const name = view.selected.has(change.path) ? '待提交' : label(change);
     const states = byLabel.get(name) ?? [];
     states.push({
       resourceUri: vscode.Uri.file(change.path),
-      decorations: { tooltip: name, strikeThrough: ['deleted', 'missing'].includes(change.item) },
+      decorations: { tooltip: label(change), strikeThrough: ['deleted', 'missing'].includes(change.item) },
       command: { command: 'codeSvn.viewChange', title: '查看差异', arguments: [change] }
     });
     byLabel.set(name, states);
   }
   for (const [name, states] of byLabel) {
     if (!view.groups.has(name)) {
-      const group = view.scm.createResourceGroup(name, name);
+      const group = view.scm.createResourceGroup(name === '待提交' ? 'selected' : name, name);
       group.hideWhenEmpty = true;
       view.groups.set(name, group);
     }
@@ -84,6 +76,7 @@ function showChanges(view: WorkingCopyView, changes: Change[]): void {
   for (const [name, group] of view.groups) if (!byLabel.has(name)) group.resourceStates = [];
   view.changes = changes;
   view.scm.count = changes.length;
+  view.scm.inputBox.placeholder = `提交信息（${view.selected.size} 项待提交，按完整文件提交）`;
 }
 
 export function activate(context: vscode.ExtensionContext): void {
@@ -92,6 +85,7 @@ export function activate(context: vscode.ExtensionContext): void {
   const watchers = new Map<string, vscode.FileSystemWatcher>();
   const documents = new Map<string, string>();
   const documentChanges = new vscode.EventEmitter<vscode.Uri>();
+  const writes = new WorkingCopyWrites();
   let knownRoots = new Map<string, string>();
   let disposed = false;
   let pending = false;
@@ -104,6 +98,84 @@ export function activate(context: vscode.ExtensionContext): void {
 
   function svnExecutable(folder: vscode.WorkspaceFolder): string {
     return vscode.workspace.getConfiguration('codeSvn', folder.uri).get<string>('svnPath', 'svn');
+  }
+
+  async function chooseChange(remove: boolean, resource?: vscode.SourceControlResourceState): Promise<void> {
+    try {
+      await refresh();
+      const choices = [...views.values()].flatMap(view => {
+        const paths = remove ? view.selected.targets : view.changes.filter(change => !view.selected.has(change.path)).map(change => change.path);
+        return paths.map(target => ({ label: path.basename(target), description: `${view.scm.rootUri!.fsPath} · ${path.relative(view.scm.rootUri!.fsPath, target)}`, view, target }));
+      });
+      const choice = resource?.resourceUri
+        ? choices.find(item => pathKey(item.target) === pathKey(resource.resourceUri.fsPath))
+        : await vscode.window.showQuickPick(choices, { placeHolder: remove ? '选择要移出待提交的文件' : '选择要加入待提交的完整文件' });
+      if (!choice) return;
+      const key = pathKey(choice.view.scm.rootUri!.fsPath);
+      if (views.get(key) !== choice.view) throw new Error('工作副本或管理范围已变化，请重新选择。');
+      if (writes.isBusy(key)) throw new Error('该工作副本正在执行写操作，请等待完成。');
+      if (remove) choice.view.selected.remove(choice.target);
+      else {
+        const change = choice.view.changes.find(change => pathKey(change.path) === pathKey(choice.target));
+        if (!change) throw new Error('变更状态或管理范围已变化，请刷新后重新选择。');
+        await choice.view.selected.add(change);
+      }
+      showChanges(choice.view, choice.view.changes);
+    } catch (error) {
+      void vscode.window.showErrorMessage(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function commit(sourceControl?: vscode.SourceControl): Promise<void> {
+    const candidates = [...views.entries()];
+    const candidate = sourceControl ? candidates.find(([, view]) => view.scm === sourceControl)
+      : candidates.length === 1 ? candidates[0]
+        : (await vscode.window.showQuickPick(candidates.map(([key, view]) => ({
+          label: view.scm.rootUri!.fsPath, description: `${view.selected.size} 项待提交`, key, view
+        })), { placeHolder: '选择要提交的工作副本' }));
+    if (!candidate) return;
+    const [key, view] = Array.isArray(candidate) ? candidate : [candidate.key, candidate.view];
+    if (writes.isBusy(key)) {
+      void vscode.window.showWarningMessage('该工作副本正在执行写操作，请等待完成；不会重复提交。');
+      return;
+    }
+    const targets = view.selected.targets;
+    if (targets.length === 0) { void vscode.window.showWarningMessage('没有待提交文件，请先加入待提交。'); return; }
+    const message = view.scm.inputBox.value;
+    if (!message.trim()) { void vscode.window.showWarningMessage('请输入提交信息。'); return; }
+    const release = writes.tryAcquire(key);
+    if (!release) return;
+    try {
+      const validate = async () => {
+        await refresh();
+        if (views.get(key) !== view || view.lastError) throw new Error('无法确认工作副本当前状态，请刷新并检查查询日志。');
+        await view.selected.validate(targets, view.changes, openedFolders().map(folder => folder.uri.fsPath));
+      };
+      await validate();
+      const dirty = () => vscode.workspace.textDocuments.filter(document => document.uri.scheme === 'file'
+        && document.isDirty && targets.some(target => pathKey(target) === pathKey(document.uri.fsPath)));
+      if (dirty().length > 0) {
+        const action = await vscode.window.showWarningMessage('选中文件有未保存内容。保存后再提交？', { modal: true }, '保存并提交');
+        if (action !== '保存并提交') return;
+        for (const document of dirty()) if (!await document.save()) throw new Error(`无法保存 ${document.uri.fsPath}，提交已停止。`);
+        await validate();
+        if (dirty().length > 0) throw new Error('选中文件仍有未保存内容，提交已停止。');
+      }
+      const folder = openedFolders().find(folder => within(folder.uri.fsPath, targets[0]))!;
+      const revision = await commitFiles(svnExecutable(folder), view.scm.rootUri!.fsPath, targets, message);
+      await refresh();
+      if (views.get(key) !== view || view.lastError) throw new Error(`SVN 已产生修订 ${revision}，但刷新失败。请核对仓库结果，勿重复提交。`);
+      view.selected.complete(targets);
+      if (view.scm.inputBox.value === message) view.scm.inputBox.value = '';
+      showChanges(view, view.changes);
+      void vscode.window.showInformationMessage(`SVN 提交成功：修订 ${revision}，${targets.length} 个完整文件。`);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      output.appendLine(`${new Date().toISOString()} 提交失败\n${detail}`);
+      const guidance = detail.startsWith('SVN 提交失败') ? '请在工作区所在环境的终端配置 SVN 路径、认证或证书信任，再手动操作。' : '';
+      void vscode.window.showErrorMessage(`${detail} 选择与提交信息已保留。${guidance}`, '查看日志')
+        .then(action => { if (action === '查看日志') output.show(); });
+    } finally { release(); }
   }
 
   async function viewChange(change: Change): Promise<void> {
@@ -221,8 +293,9 @@ export function activate(context: vscode.ExtensionContext): void {
     for (const [key, copy] of copies) {
       if (!views.has(key)) {
         const scm = vscode.scm.createSourceControl('codeSvn', 'SVN', vscode.Uri.file(copy.root));
-        scm.inputBox.visible = false;
-        views.set(key, { scm, groups: new Map(), changes: [], lastError: '' });
+        scm.inputBox.visible = true;
+        scm.acceptInputCommand = { command: 'codeSvn.commit', title: '提交待提交文件', arguments: [scm] };
+        views.set(key, { scm, groups: new Map(), changes: [], lastError: '', selected: new CommitSelection(copy.root) });
       }
       const view = views.get(key)!;
       if (copy.errors.length === 0) {
@@ -284,6 +357,9 @@ export function activate(context: vscode.ExtensionContext): void {
     documentChanges,
     vscode.commands.registerCommand('codeSvn.refresh', refresh),
     vscode.commands.registerCommand('codeSvn.showOutput', () => output.show()),
+    vscode.commands.registerCommand('codeSvn.select', (resource?: vscode.SourceControlResourceState) => chooseChange(false, resource)),
+    vscode.commands.registerCommand('codeSvn.unselect', (resource?: vscode.SourceControlResourceState) => chooseChange(true, resource)),
+    vscode.commands.registerCommand('codeSvn.commit', commit),
     vscode.commands.registerCommand('codeSvn.viewChange', (change: Change) => viewChange(change)),
     vscode.workspace.registerTextDocumentContentProvider(contentScheme, {
       onDidChange: documentChanges.event,
