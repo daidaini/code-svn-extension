@@ -1,0 +1,45 @@
+{
+  "name": "code-svn-extension",
+  "displayName": "Code SVN",
+  "description": "在打开目录内管理 SVN 项目",
+  "version": "0.1.0",
+  "publisher": "daidaini",
+  "private": true,
+  "engines": { "vscode": "^1.100.0" },
+  "categories": ["SCM Providers"],
+  "extensionKind": ["workspace"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./dist/extension.js",
+  "scripts": {
+    "build": "tsc -p .",
+    "typecheck": "tsc --noEmit -p .",
+    "test": "npm run build && node --test --test-concurrency=1 test/*.test.cjs"
+  },
+  "contributes": {
+    "commands": [
+      { "command": "codeSvn.refresh", "title": "SVN：刷新变更", "icon": "$(refresh)" },
+      { "command": "codeSvn.showOutput", "title": "SVN：查看查询日志" }
+    ],
+    "menus": {
+      "scm/title": [
+        { "command": "codeSvn.refresh", "when": "scmProvider == codeSvn", "group": "navigation" }
+      ]
+    },
+    "configuration": {
+      "title": "Code SVN",
+      "properties": {
+        "codeSvn.svnPath": {
+          "type": "string", "default": "svn", "scope": "machine-overridable",
+          "description": "工作区所在环境的 SVN 可执行文件路径。Windows 与 WSL 分别安装和配置 SVN。"
+        }
+      }
+    }
+  },
+  "dependencies": { "fast-xml-parser": "5.11.2" },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/vscode": "1.100.0",
+    "playwright": "1.64.0",
+    "typescript": "~5.9.3"
+  }
+}
