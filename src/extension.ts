@@ -1,6 +1,12 @@
 import * as vscode from 'vscode';
 import * as path from 'node:path';
-import { Change, readChanges, WorkingCopyQueryError } from './svn';
+import {
+  Change, PropertyChange, PropertyValue, readChanges, readDifference, readWorkingContent, WorkingCopyQueryError
+} from './svn';
+
+// Local and base content reach the diff editor through this scheme so a deleted
+// side, a directory and an added item all have something honest to show.
+const contentScheme = 'codeSvn';
 
 const labels: Record<string, string> = {
   modified: '已修改', added: '已添加', deleted: '已删除', missing: '本地缺失',
@@ -24,6 +30,23 @@ function within(folder: string, target: string): boolean {
   return relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
 }
 
+function sideUri(target: string, side: 'base' | 'working' | 'properties'): vscode.Uri {
+  return vscode.Uri.file(target).with({ scheme: contentScheme, query: side });
+}
+
+function propertyText(changes: PropertyChange[], target: string): string {
+  const lines = [`SVN 属性差异：${target}`, ''];
+  const value = (property: PropertyValue | undefined) => property === undefined ? ''
+    : property.encoding === 'base64' ? `（Base64 编码属性：${property.value}）` : property.value;
+  for (const change of changes) {
+    if (change.before === undefined) lines.push(`新增属性 ${change.name} = ${value(change.after)}`);
+    else if (change.after === undefined) lines.push(`删除属性 ${change.name}（原值：${value(change.before)}）`);
+    else lines.push(`修改属性 ${change.name}：${value(change.before)} → ${value(change.after)}`);
+  }
+  if (changes.length === 0) lines.push('（没有属性变化）');
+  return lines.join('\n');
+}
+
 interface WorkingCopyView {
   scm: vscode.SourceControl;
   groups: Map<string, vscode.SourceControlResourceGroup>;
@@ -45,7 +68,8 @@ function showChanges(view: WorkingCopyView, changes: Change[]): void {
     const states = byLabel.get(name) ?? [];
     states.push({
       resourceUri: vscode.Uri.file(change.path),
-      decorations: { tooltip: name, strikeThrough: ['deleted', 'missing'].includes(change.item) }
+      decorations: { tooltip: name, strikeThrough: ['deleted', 'missing'].includes(change.item) },
+      command: { command: 'codeSvn.viewChange', title: '查看差异', arguments: [change] }
     });
     byLabel.set(name, states);
   }
@@ -66,6 +90,8 @@ export function activate(context: vscode.ExtensionContext): void {
   const output = vscode.window.createOutputChannel('Code SVN');
   const views = new Map<string, WorkingCopyView>();
   const watchers = new Map<string, vscode.FileSystemWatcher>();
+  const documents = new Map<string, string>();
+  const documentChanges = new vscode.EventEmitter<vscode.Uri>();
   let knownRoots = new Map<string, string>();
   let disposed = false;
   let pending = false;
@@ -74,6 +100,74 @@ export function activate(context: vscode.ExtensionContext): void {
 
   function openedFolders(): vscode.WorkspaceFolder[] {
     return (vscode.workspace.workspaceFolders ?? []).filter(folder => folder.uri.scheme === 'file');
+  }
+
+  function svnExecutable(folder: vscode.WorkspaceFolder): string {
+    return vscode.workspace.getConfiguration('codeSvn', folder.uri).get<string>('svnPath', 'svn');
+  }
+
+  async function viewChange(change: Change): Promise<void> {
+    const name = path.basename(change.path);
+    const folder = openedFolders().find(candidate => within(candidate.uri.fsPath, change.path));
+    if (!folder) {
+      void vscode.window.showErrorMessage(`无法查看 ${name}：该路径不在当前打开的 SVN 管理范围内，请把所在目录加入工作区后重试。`);
+      return;
+    }
+    const executable = svnExecutable(folder);
+    try {
+      // An unversioned file has no SVN text to compare. Showing its content as a
+      // diff would claim a comparison SVN never made.
+      if (change.item === 'unversioned') {
+        const working = await readWorkingContent(change.path);
+        if (working.binary) {
+          void vscode.window.showWarningMessage(`${name}：未跟踪文件是二进制内容，没有可分析的文本。`);
+          return;
+        }
+        if (working.symbolicLink) {
+          const uri = sideUri(change.path, 'working');
+          documents.set(uri.toString(), working.text ?? '');
+          documentChanges.fire(uri);
+          await vscode.window.showTextDocument(uri);
+        } else {
+          await vscode.window.showTextDocument(vscode.Uri.file(change.path));
+        }
+        void vscode.window.showInformationMessage(`${name}：未跟踪文件尚未加入 SVN，没有 SVN 差异可比较；已打开${working.symbolicLink ? '链接目标' : '本地文件内容'}。`);
+        return;
+      }
+      const content = await readDifference(executable, folder.uri.fsPath, change);
+      const properties = content.properties;
+      for (const [side, text] of [
+        ['base', content.base ?? ''], ['working', content.text ?? ''],
+        ['properties', propertyText(properties, change.path)]
+      ] as const) {
+        const uri = sideUri(change.path, side);
+        documents.set(uri.toString(), text);
+        documentChanges.fire(uri);
+      }
+      if (properties.length > 0) await vscode.window.showTextDocument(sideUri(change.path, 'properties'), { preview: false });
+      if (content.binary) {
+        void vscode.window.showWarningMessage(`${name}：${label(change)}，但 SVN 没有提供文本差异，二进制内容不可分析，本次没有分析文件内容。`);
+        return;
+      }
+      if (content.base === undefined && content.text === undefined) {
+        void vscode.window.showInformationMessage(`${name}：该 SVN 条目没有文本内容差异可展示，请查看其 SVN 属性变化。`);
+        return;
+      }
+      if (content.base === content.text) {
+        if (properties.length === 0) {
+          void vscode.window.showInformationMessage(`${name}：${label(change)}，没有可展示的文本内容差异。`);
+        }
+        return;
+      }
+      await vscode.commands.executeCommand('vscode.diff', sideUri(change.path, 'base'),
+        sideUri(change.path, 'working'), `${name}（${label(change)} · SVN 本地差异）`);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      output.appendLine(`${new Date().toISOString()} 查看差异失败 ${change.path}\n${detail}`);
+      void vscode.window.showErrorMessage(
+        `查看 ${name} 的差异失败：${detail}请检查工作区环境的 SVN 安装与 codeSvn.svnPath 设置。`, '查看日志'
+      ).then(action => { if (action === '查看日志') output.show(); });
+    }
   }
 
   async function refreshOnce(): Promise<void> {
@@ -159,6 +253,15 @@ export function activate(context: vscode.ExtensionContext): void {
     }
   }
 
+  function content(uri: vscode.Uri): string {
+    const target = uri.fsPath;
+    const folder = openedFolders().find(candidate => within(candidate.uri.fsPath, target));
+    if (!folder) throw new Error(`${target} 不在当前打开的 SVN 管理范围内，无法读取内容。`);
+    const text = documents.get(uri.toString());
+    if (text === undefined) throw new Error('差异内容已关闭，请从 SVN 变更列表重新打开。');
+    return text;
+  }
+
   function refresh(): Promise<void> {
     pending = true;
     if (!running) {
@@ -178,8 +281,15 @@ export function activate(context: vscode.ExtensionContext): void {
   const poll = setInterval(() => { void refresh(); }, 5000);
   context.subscriptions.push(
     output,
+    documentChanges,
     vscode.commands.registerCommand('codeSvn.refresh', refresh),
     vscode.commands.registerCommand('codeSvn.showOutput', () => output.show()),
+    vscode.commands.registerCommand('codeSvn.viewChange', (change: Change) => viewChange(change)),
+    vscode.workspace.registerTextDocumentContentProvider(contentScheme, {
+      onDidChange: documentChanges.event,
+      provideTextDocumentContent: content
+    }),
+    vscode.workspace.onDidCloseTextDocument(document => { documents.delete(document.uri.toString()); }),
     vscode.workspace.onDidChangeWorkspaceFolders(() => { void refresh(); }),
     vscode.workspace.onDidChangeConfiguration(event => {
       if (event.affectsConfiguration('codeSvn.svnPath')) void refresh();

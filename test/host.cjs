@@ -48,6 +48,8 @@ async function host(root, folder, settings = {}) {
     'git.enabled': false,
     'scm.defaultViewMode': 'list',
     'scm.alwaysShowRepositories': false,
+    'diffEditor.renderSideBySide': true,
+    'diffEditor.useInlineViewWhenSpaceIsLimited': false,
     ...settings
   }));
   let executable = process.env.VSCODE_EXECUTABLE;
@@ -94,6 +96,29 @@ async function host(root, folder, settings = {}) {
       async scmText() {
         await page.keyboard.press('Control+Shift+G');
         return (await page.locator('.scm-view .monaco-list-row').allInnerTexts()).join('\n');
+      },
+      async openChange(name) {
+        await page.keyboard.press('Control+Shift+G');
+        await page.locator('.scm-view .monaco-list-row').filter({ hasText: name }).first().click();
+      },
+      async diffSides() {
+        const side = selector => page.locator(selector).allInnerTexts().then(parts => parts.join('\n').replace(/\u00a0/g, ' '));
+        return {
+          original: await side('.original-in-monaco-diff-editor .view-lines'),
+          modified: await side('.modified-in-monaco-diff-editor .view-lines')
+        };
+      },
+      async diffCount() {
+        return page.locator('.monaco-diff-editor').count();
+      },
+      async editorText() {
+        return (await page.locator('.monaco-editor .view-lines').allInnerTexts()).join('\n').replace(/\u00a0/g, ' ');
+      },
+      async editorTabs() {
+        return (await page.locator('.editor-group-container.active .tab').allInnerTexts()).join('\n');
+      },
+      async notifications() {
+        return page.locator('.notifications-toasts').innerText().catch(() => '');
       },
       async close() {
         await page.close();

@@ -10,6 +10,28 @@ export interface Change {
   conflicted: boolean;
 }
 
+export interface PropertyValue {
+  value: string;
+  encoding: 'text' | 'base64';
+}
+
+export interface PropertyChange {
+  name: string;
+  before?: PropertyValue;
+  after?: PropertyValue;
+}
+
+export interface WorkingContent {
+  text?: string;
+  binary: boolean;
+  symbolicLink?: boolean;
+}
+
+export interface ChangeContent extends WorkingContent {
+  base?: string;
+  properties: PropertyChange[];
+}
+
 class SvnError extends Error {
   constructor(message: string, readonly stderr: string) { super(message); }
 }
@@ -20,15 +42,20 @@ export class WorkingCopyQueryError extends Error {
   }
 }
 
-function run(executable: string, cwd: string, args: string[]): Promise<string> {
+function exec(executable: string, cwd: string, args: string[]): Promise<Buffer> {
   return new Promise((resolve, reject) => {
-    execFile(executable, [...args, '--non-interactive'], {
-      cwd, encoding: 'utf8', windowsHide: true, timeout: 20000, maxBuffer: 32 * 1024 * 1024
+    // Keep the command first, but never put options after the target terminator.
+    const terminator = args.indexOf('--');
+    const command = [...args];
+    command.splice(terminator === -1 ? command.length : terminator, 0, '--non-interactive');
+    execFile(executable, command, {
+      cwd, encoding: 'buffer', windowsHide: true, timeout: 20000, maxBuffer: 32 * 1024 * 1024
     }, (error, stdout, stderr) => {
       // SVN can return exit 0 with warnings and an incomplete/empty status.
       // Such a result cannot establish that the managed scope is clean.
-      if (error || stderr.trim()) {
-        reject(new SvnError(`SVN 查询失败：${stderr.trim() || error?.message}`, stderr));
+      const detail = stderr.toString('utf8');
+      if (error || detail.trim()) {
+        reject(new SvnError(`SVN 查询失败：${detail.trim() || error?.message}`, detail));
       } else {
         resolve(stdout);
       }
@@ -36,9 +63,13 @@ function run(executable: string, cwd: string, args: string[]): Promise<string> {
   });
 }
 
+function run(executable: string, cwd: string, args: string[]): Promise<string> {
+  return exec(executable, cwd, args).then(stdout => stdout.toString('utf8'));
+}
+
 const parser = new XMLParser({
   ignoreAttributes: false, parseTagValue: false, parseAttributeValue: false,
-  trimValues: false, isArray: name => ['entry', 'target', 'changelist'].includes(name)
+  trimValues: false, isArray: name => ['entry', 'target', 'changelist', 'property'].includes(name)
 });
 
 function parse(xml: string) {
@@ -108,4 +139,109 @@ async function readStatus(executable: string, folder: string): Promise<Change[]>
     return [{ path: target, item, props, conflicted }];
   });
   return changes;
+}
+
+function toArray(value: unknown): any[] {
+  return value === undefined || value === null ? [] : Array.isArray(value) ? value : [value];
+}
+
+// SVN answers "no pristine version" for added items and "refers to a directory"
+// for directories. Neither means the working copy could not be read.
+const noContentTarget = /(?:E|W)(?:195007|200009)/;
+// A deleted or unversioned target has no working property list at all.
+const noPropertyTarget = /(?:W)200005|(?:E)200009/;
+
+function isBinary(bytes: Buffer): boolean {
+  if (bytes.includes(0)) return true;
+  try {
+    new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    return false;
+  } catch (error) {
+    return true;
+  }
+}
+
+function asText(bytes: Buffer | undefined): string | undefined {
+  return bytes === undefined ? undefined : new TextDecoder('utf-8').decode(bytes);
+}
+
+async function readLocal(target: string): Promise<{ bytes?: Buffer; symbolicLink?: boolean }> {
+  try {
+    const stat = await fs.lstat(target);
+    if (stat.isDirectory()) return {};
+    // SVN versions the link target, never the pointed-to file's contents.
+    if (stat.isSymbolicLink()) return { bytes: Buffer.from(`link ${await fs.readlink(target)}`, 'utf8'), symbolicLink: true };
+    return { bytes: await fs.readFile(target) };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return {};
+    throw error;
+  }
+}
+
+async function catBase(executable: string, dir: string, name: string): Promise<Buffer | undefined> {
+  try {
+    return await exec(executable, dir, ['cat', '-r', 'BASE', '--', `${name}@`]);
+  } catch (error) {
+    if (error instanceof SvnError && noContentTarget.test(error.stderr)) return undefined;
+    throw error;
+  }
+}
+
+export async function readWorkingContent(target: string): Promise<WorkingContent> {
+  const local = await readLocal(target);
+  return { text: asText(local.bytes), binary: local.bytes !== undefined && isBinary(local.bytes), symbolicLink: local.symbolicLink };
+}
+
+async function readContent(executable: string, folder: string, change: Change): Promise<WorkingContent & { base?: string }> {
+  const base = await catBase(executable, folder, path.relative(folder, change.path) || '.');
+  const bytes = change.item === 'deleted' ? undefined : (await readLocal(change.path)).bytes;
+  return {
+    base: asText(base),
+    text: asText(bytes),
+    binary: [base, bytes].some(content => content !== undefined && isBinary(content))
+  };
+}
+
+async function propertyMap(executable: string, dir: string, args: string[]): Promise<Map<string, PropertyValue>> {
+  let xml;
+  try {
+    xml = await run(executable, dir, args);
+  } catch (error) {
+    if (error instanceof SvnError && noPropertyTarget.test(error.stderr)) return new Map();
+    throw error;
+  }
+  const properties = new Map<string, PropertyValue>();
+  for (const target of toArray(parse(xml).properties?.target)) {
+    for (const property of toArray(target?.property)) {
+      const encoding = property['@_encoding'] === 'base64' ? 'base64' : 'text';
+      const value = typeof property['#text'] === 'string' ? property['#text'] : '';
+      properties.set(property['@_name'], { value: encoding === 'base64' ? Buffer.from(value, 'base64').toString('base64') : value, encoding });
+    }
+  }
+  return properties;
+}
+
+// Properties are read as UTF-8 XML; SVN's own unified diff output uses the
+// console encoding, so it cannot carry Chinese paths into the editor intact.
+export async function readDifference(executable: string, folder: string, change: Change): Promise<ChangeContent> {
+  const name = path.relative(folder, change.path) || '.';
+  const [before, after] = await Promise.all([
+    propertyMap(executable, folder, ['proplist', '--xml', '-v', '--depth', 'empty', '-r', 'BASE', '--', `${name}@`]),
+    propertyMap(executable, folder, ['proplist', '--xml', '-v', '--depth', 'empty', '--', `${name}@`])
+  ]);
+  const changes: PropertyChange[] = [];
+  for (const [property, value] of before) {
+    if (!after.has(property)) changes.push({ name: property, before: value });
+    else if (after.get(property)!.value !== value.value || after.get(property)!.encoding !== value.encoding) {
+      changes.push({ name: property, before: value, after: after.get(property) });
+    }
+  }
+  for (const [property, value] of after) if (!before.has(property)) changes.push({ name: property, after: value });
+  const content = await readContent(executable, folder, change);
+  // SVN treats these two image formats as text alongside text/* MIME types.
+  const binaryMime = [before, after].some(properties => {
+    const mime = properties.get('svn:mime-type')?.value;
+    return mime !== undefined && !mime.startsWith('text/') && !['image/x-xbitmap', 'image/x-xpixmap'].includes(mime);
+  });
+  return { ...content, binary: content.binary || binaryMime, properties: changes };
 }
