@@ -85,13 +85,12 @@ test('未保存的选中文件可取消提交，确认保存后才提交完整�
   }
 });
 
-test('空选择与移出待提交均不产生修订，新增和目录变更不能加入待提交', { timeout: 120000 }, async () => {
+test('空选择与移出待提交均不产生修订，未跟踪和目录属性变更不能加入待提交', { timeout: 120000 }, async () => {
   const f = await fixture();
   let ui;
   try {
     await fs.writeFile(path.join(f.scope, '修改 中文.txt'), 'LOCAL\n');
     await fs.writeFile(path.join(f.scope, '新增.txt'), 'NEW\n');
-    svn(f.scope, 'add', '新增.txt');
     svn(f.scope, 'propset', 'owner', 'team', '.');
     ui = await host(f.root, f.scope);
     await ui.command('SVN：刷新变更');
@@ -99,9 +98,9 @@ test('空选择与移出待提交均不产生修订，新增和目录变更不�
     await ui.command('SVN：提交待提交文件');
     await eventually(async () => assert.match(await ui.notifications(), /没有待提交文件/));
     await ui.chooseChange('SVN：加入待提交', '新增.txt');
-    await eventually(async () => assert.match(await ui.notifications(), /仅支持普通版本控制文件/));
+    await eventually(async () => assert.match(await ui.notifications(), /请先执行添加到版本控制/));
     await ui.chooseChange('SVN：加入待提交', '中文 空格 @目录');
-    await eventually(async () => assert.match(await ui.notifications(), /尚不支持目录提交/));
+    await eventually(async () => assert.match(await ui.notifications(), /尚不支持该目录提交/));
     await ui.chooseChange('SVN：加入待提交', '修改 中文.txt');
     await ui.chooseChange('SVN：移出待提交', '修改 中文.txt');
     await eventually(async () => assert.doesNotMatch(await ui.scmText(), /(?:^|\n)待提交(?:\n|$)/));

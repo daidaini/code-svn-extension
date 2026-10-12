@@ -9,6 +9,7 @@ export interface Change {
   item: string;
   props: string;
   conflicted: boolean;
+  copied?: boolean;
 }
 
 export interface PropertyValue {
@@ -84,8 +85,9 @@ function within(folder: string, target: string): boolean {
 }
 
 // Use cwd plus "." so spaces, Unicode and @ in opened directory names never
-// become shell text or SVN peg revisions. No parent/sibling status query.
-export async function readChanges(executable: string, folder: string): Promise<{ root: string; changes: Change[] } | undefined> {
+// become shell text or SVN peg revisions. Ancestors are queried shallowly only
+// for dependency metadata, never to discover sibling changes.
+export async function readChanges(executable: string, folder: string): Promise<{ root: string; changes: Change[]; ancestors: Change[] } | undefined> {
   let info;
   try {
     info = parse(await run(executable, folder, ['info', '--xml', '.']));
@@ -98,14 +100,22 @@ export async function readChanges(executable: string, folder: string): Promise<{
   }
   const root = path.normalize(info.info.entry[0]['wc-info']['wcroot-abspath']);
   try {
-    return { root, changes: await readStatus(executable, folder) };
+    const parents: string[] = [];
+    for (let parent = path.dirname(folder); within(root, parent) && path.relative(root, parent) !== ''; parent = path.dirname(parent)) {
+      parents.push(`${path.relative(root, parent)}@`);
+    }
+    const [changes, ancestors] = await Promise.all([
+      readStatus(executable, folder),
+      parents.length > 0 ? readStatus(executable, root, parents, 'empty') : Promise.resolve([])
+    ]);
+    return { root, changes, ancestors };
   } catch (error) {
     throw new WorkingCopyQueryError(root, error);
   }
 }
 
-async function readStatus(executable: string, folder: string): Promise<Change[]> {
-  const status = parse(await run(executable, folder, ['status', '--xml', '--verbose', '--ignore-externals', '.']));
+async function readStatus(executable: string, folder: string, targets = ['.'], depth = 'infinity'): Promise<Change[]> {
+  const status = parse(await run(executable, folder, ['status', '--xml', '--verbose', '--ignore-externals', '--depth', depth, '--', ...targets]));
   if (!status.status) throw new Error('SVN 未返回状态信息，无法确认变更。');
   const entries = [
     ...(status.status.target ?? []).flatMap((target: any) => [
@@ -137,7 +147,7 @@ async function readStatus(executable: string, folder: string): Promise<Change[]>
     const conflicted = item === 'conflicted' || props === 'conflicted' || wcStatus['@_tree-conflicted'] === 'true';
     if (excluded.some(excludedPath => within(excludedPath, target))) return [];
     if (!conflicted && ['normal', 'none', 'ignored'].includes(item) && ['none', 'normal'].includes(props)) return [];
-    return [{ path: target, item, props, conflicted }];
+    return [{ path: target, item, props, conflicted, copied: wcStatus['@_copied'] === 'true' }];
   });
   return changes;
 }
@@ -245,6 +255,10 @@ export async function readDifference(executable: string, folder: string, change:
     return mime !== undefined && !mime.startsWith('text/') && !['image/x-xbitmap', 'image/x-xpixmap'].includes(mime);
   });
   return { ...content, binary: content.binary || binaryMime, properties: changes };
+}
+
+export async function addPath(executable: string, root: string, target: string): Promise<void> {
+  await run(executable, root, ['add', '--depth', 'empty', '--', `${path.relative(root, target)}@`]);
 }
 
 export async function commitFiles(executable: string, root: string, targets: string[], message: string): Promise<number> {

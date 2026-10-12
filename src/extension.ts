@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import * as path from 'node:path';
 import { CommitSelection, WorkingCopyWrites, pathKey, within } from './commit-selection';
 import {
-  Change, PropertyChange, PropertyValue, commitFiles, readChanges, readDifference, readWorkingContent, WorkingCopyQueryError
+  Change, PropertyChange, PropertyValue, addPath, commitFiles, readChanges, readDifference, readWorkingContent, WorkingCopyQueryError
 } from './svn';
 
 // Local and base content reach the diff editor through this scheme so a deleted
@@ -42,6 +42,7 @@ interface WorkingCopyView {
   scm: vscode.SourceControl;
   groups: Map<string, vscode.SourceControlResourceGroup>;
   changes: Change[];
+  ancestors: Change[];
   lastError: string;
   selected: CommitSelection;
 }
@@ -50,24 +51,26 @@ interface WorkingCopyResult {
   root: string;
   folders: vscode.WorkspaceFolder[];
   changes: Map<string, Change>;
+  ancestors: Map<string, Change>;
   errors: string[];
 }
 
 function showChanges(view: WorkingCopyView, changes: Change[]): void {
+  view.selected.reconcile([...view.ancestors, ...changes]);
   const byLabel = new Map<string, vscode.SourceControlResourceState[]>();
   for (const change of changes) {
-    const name = view.selected.has(change.path) ? '待提交' : label(change);
+    const name = view.selected.has(change.path) ? '待提交' : view.selected.isDependency(change.path) ? '必需提交依赖' : label(change);
     const states = byLabel.get(name) ?? [];
     states.push({
       resourceUri: vscode.Uri.file(change.path),
-      decorations: { tooltip: label(change), strikeThrough: ['deleted', 'missing'].includes(change.item) },
+      decorations: { tooltip: `${label(change)}${view.selected.isDependency(change.path) ? ' · 必需提交依赖（随选定子项一起提交）' : ''}`, strikeThrough: ['deleted', 'missing'].includes(change.item) },
       command: { command: 'codeSvn.viewChange', title: '查看差异', arguments: [change] }
     });
     byLabel.set(name, states);
   }
   for (const [name, states] of byLabel) {
     if (!view.groups.has(name)) {
-      const group = view.scm.createResourceGroup(name === '待提交' ? 'selected' : name, name);
+      const group = view.scm.createResourceGroup(name === '待提交' ? 'selected' : name === '必需提交依赖' ? 'dependencies' : name, name);
       group.hideWhenEmpty = true;
       view.groups.set(name, group);
     }
@@ -76,7 +79,7 @@ function showChanges(view: WorkingCopyView, changes: Change[]): void {
   for (const [name, group] of view.groups) if (!byLabel.has(name)) group.resourceStates = [];
   view.changes = changes;
   view.scm.count = changes.length;
-  view.scm.inputBox.placeholder = `提交信息（${view.selected.size} 项待提交，按完整文件提交）`;
+  view.scm.inputBox.placeholder = `提交信息（${view.selected.size} 项待提交，含必需依赖，按完整文件提交）`;
 }
 
 export function activate(context: vscode.ExtensionContext): void {
@@ -104,7 +107,7 @@ export function activate(context: vscode.ExtensionContext): void {
     try {
       await refresh();
       const choices = [...views.values()].flatMap(view => {
-        const paths = remove ? view.selected.targets : view.changes.filter(change => !view.selected.has(change.path)).map(change => change.path);
+        const paths = remove ? view.selected.explicitTargets : view.changes.filter(change => !view.selected.has(change.path)).map(change => change.path);
         return paths.map(target => ({ label: path.basename(target), description: `${view.scm.rootUri!.fsPath} · ${path.relative(view.scm.rootUri!.fsPath, target)}`, view, target }));
       });
       const choice = resource?.resourceUri
@@ -118,12 +121,43 @@ export function activate(context: vscode.ExtensionContext): void {
       else {
         const change = choice.view.changes.find(change => pathKey(change.path) === pathKey(choice.target));
         if (!change) throw new Error('变更状态或管理范围已变化，请刷新后重新选择。');
-        await choice.view.selected.add(change);
+        await choice.view.selected.add(change, openedFolders().map(folder => folder.uri.fsPath));
       }
       showChanges(choice.view, choice.view.changes);
     } catch (error) {
       void vscode.window.showErrorMessage(error instanceof Error ? error.message : String(error));
     }
+  }
+
+  async function add(resource?: vscode.SourceControlResourceState): Promise<void> {
+    let release: (() => void) | undefined;
+    try {
+      await refresh();
+      const choices = [...views.entries()].flatMap(([key, view]) => view.changes
+        .filter(change => change.item === 'unversioned')
+        .map(change => ({ label: path.basename(change.path), description: change.path, key, view, change })));
+      const choice = resource?.resourceUri
+        ? choices.find(item => pathKey(item.change.path) === pathKey(resource.resourceUri.fsPath))
+        : await vscode.window.showQuickPick(choices, { placeHolder: '选择要添加到 SVN 的文件或目录（目录仅添加自身）' });
+      if (!choice) return;
+      release = writes.tryAcquire(choice.key);
+      if (!release) throw new Error('该工作副本正在执行写操作，请等待完成。');
+      await refresh();
+      const folder = openedFolders().find(folder => within(folder.uri.fsPath, choice.change.path));
+      if (!folder || views.get(choice.key) !== choice.view || choice.view.lastError
+        || !choice.view.changes.some(change => pathKey(change.path) === pathKey(choice.change.path) && change.item === 'unversioned')) {
+        throw new Error('变更状态或管理范围已变化，请刷新后重新添加。');
+      }
+      await choice.view.selected.validateAddition(choice.change, openedFolders().map(folder => folder.uri.fsPath));
+      await addPath(svnExecutable(folder), choice.view.scm.rootUri!.fsPath, choice.change.path);
+      await refresh();
+      if (views.get(choice.key) !== choice.view || choice.view.lastError) throw new Error('SVN 添加已执行，但刷新失败，请核对状态后继续。');
+      void vscode.window.showInformationMessage(`${path.basename(choice.change.path)} 已添加到 SVN，尚未加入待提交；请审阅后明确选择。`);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      output.appendLine(`${new Date().toISOString()} 添加失败\n${detail}`);
+      void vscode.window.showErrorMessage(`添加失败：${detail} 选择与提交信息已保留。`);
+    } finally { release?.(); }
   }
 
   async function commit(sourceControl?: vscode.SourceControl): Promise<void> {
@@ -149,7 +183,7 @@ export function activate(context: vscode.ExtensionContext): void {
       const validate = async () => {
         await refresh();
         if (views.get(key) !== view || view.lastError) throw new Error('无法确认工作副本当前状态，请刷新并检查查询日志。');
-        await view.selected.validate(targets, view.changes, openedFolders().map(folder => folder.uri.fsPath));
+        await view.selected.validate(targets, [...view.ancestors, ...view.changes], openedFolders().map(folder => folder.uri.fsPath));
       };
       await validate();
       const dirty = () => vscode.workspace.textDocuments.filter(document => document.uri.scheme === 'file'
@@ -168,7 +202,7 @@ export function activate(context: vscode.ExtensionContext): void {
       view.selected.complete(targets);
       if (view.scm.inputBox.value === message) view.scm.inputBox.value = '';
       showChanges(view, view.changes);
-      void vscode.window.showInformationMessage(`SVN 提交成功：修订 ${revision}，${targets.length} 个完整文件。`);
+      void vscode.window.showInformationMessage(`SVN 提交成功：修订 ${revision}，${targets.length} 项变更（含必需提交依赖）。`);
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       output.appendLine(`${new Date().toISOString()} 提交失败\n${detail}`);
@@ -276,11 +310,12 @@ export function activate(context: vscode.ExtensionContext): void {
           : knownRoots.get(folder.uri.toString()) ?? folder.uri.fsPath;
       const key = pathKey(root);
       nextRoots.set(folder.uri.toString(), root);
-      if (!copies.has(key)) copies.set(key, { root, folders: [], changes: new Map(), errors: [] });
+      if (!copies.has(key)) copies.set(key, { root, folders: [], changes: new Map(), ancestors: new Map(), errors: [] });
       const copy = copies.get(key)!;
       copy.folders.push(folder);
       if (result.status === 'fulfilled') {
         for (const change of result.value!.changes) copy.changes.set(pathKey(change.path), change);
+        for (const ancestor of result.value!.ancestors) copy.ancestors.set(pathKey(ancestor.path), ancestor);
       } else {
         const detail = result.reason instanceof Error ? result.reason.message : String(result.reason);
         copy.errors.push(`${folder.uri.fsPath}\n${detail}`);
@@ -295,11 +330,12 @@ export function activate(context: vscode.ExtensionContext): void {
         const scm = vscode.scm.createSourceControl('codeSvn', 'SVN', vscode.Uri.file(copy.root));
         scm.inputBox.visible = true;
         scm.acceptInputCommand = { command: 'codeSvn.commit', title: '提交待提交文件', arguments: [scm] };
-        views.set(key, { scm, groups: new Map(), changes: [], lastError: '', selected: new CommitSelection(copy.root) });
+        views.set(key, { scm, groups: new Map(), changes: [], ancestors: [], lastError: '', selected: new CommitSelection(copy.root) });
       }
       const view = views.get(key)!;
       if (copy.errors.length === 0) {
         view.lastError = '';
+        view.ancestors = [...copy.ancestors.values()];
         showChanges(view, [...copy.changes.values()]);
         view.scm.statusBarCommands = [{
           command: 'codeSvn.refresh', title: `$(source-control) SVN：${view.changes.length} 项变更`,
@@ -359,6 +395,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('codeSvn.showOutput', () => output.show()),
     vscode.commands.registerCommand('codeSvn.select', (resource?: vscode.SourceControlResourceState) => chooseChange(false, resource)),
     vscode.commands.registerCommand('codeSvn.unselect', (resource?: vscode.SourceControlResourceState) => chooseChange(true, resource)),
+    vscode.commands.registerCommand('codeSvn.add', add),
     vscode.commands.registerCommand('codeSvn.commit', commit),
     vscode.commands.registerCommand('codeSvn.viewChange', (change: Change) => viewChange(change)),
     vscode.workspace.registerTextDocumentContentProvider(contentScheme, {
