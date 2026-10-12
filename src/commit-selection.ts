@@ -12,6 +12,19 @@ export function within(folder: string, target: string): boolean {
   return relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
 }
 
+// A scheduled-for-deletion directory is one whole-subtree operation: its
+// deleted descendants are affected children shown for review, never separate
+// selectable commits. Returns the topmost deleted directory above the target.
+export function deletedTreeRoot(target: string, changes: Change[]): Change | undefined {
+  let root: Change | undefined;
+  for (const change of changes) {
+    if (change.item !== 'deleted' || change.kind !== 'dir') continue;
+    if (pathKey(change.path) === pathKey(target) || !within(change.path, target)) continue;
+    if (!root || within(change.path, root.path)) root = change;
+  }
+  return root;
+}
+
 export class CommitSelection {
   private readonly files = new Map<string, string>();
   private readonly dependencies = new Map<string, string>();
@@ -51,12 +64,21 @@ export class CommitSelection {
   private async checkFile(change: Change): Promise<void> {
     if (change.conflicted) throw new Error(`${path.basename(change.path)} 存在冲突，请先解决冲突。`);
     if (change.item === 'unversioned') throw new Error(`${path.basename(change.path)} 尚未跟踪，请先执行添加到版本控制，再加入待提交。`);
+    if (change.item === 'deleted') {
+      // The scheduled directory may already be gone from disk; committing its
+      // node deletes the whole subtree as one operation.
+      if (change.kind === 'dir') return;
+      throw new Error(`${path.basename(change.path)} 的当前状态不支持提交。删除操作尚未开放。`);
+    }
     if (!['modified', 'normal', 'added'].includes(change.item) || (change.item === 'normal' && change.props !== 'modified')) {
       throw new Error(`${path.basename(change.path)} 的当前状态不支持提交。删除操作尚未开放。`);
     }
     const stat = await fs.lstat(change.path);
     if (stat.isDirectory() && change.item === 'added' && !change.copied) return;
-    if (!stat.isFile() && !stat.isSymbolicLink()) throw new Error('当前尚不支持该目录提交；仅允许普通新增目录作为显式选择或必需提交依赖。');
+    // Directory property commits carry --depth empty: only the directory's own
+    // properties are sent, never the children's changes.
+    if (stat.isDirectory() && change.props === 'modified' && ['modified', 'normal'].includes(change.item)) return;
+    if (!stat.isFile() && !stat.isSymbolicLink()) throw new Error('当前尚不支持该目录提交；仅允许普通新增目录、目录属性变更或整体目录删除。');
   }
 
   async validateAddition(change: Change, scopes: string[]): Promise<void> {

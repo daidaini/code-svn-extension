@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import * as path from 'node:path';
-import { CommitSelection, WorkingCopyWrites, pathKey, within } from './commit-selection';
+import { CommitSelection, WorkingCopyWrites, deletedTreeRoot, pathKey, within } from './commit-selection';
 import {
   Change, PropertyChange, PropertyValue, addPath, commitFiles, readChanges, readDifference, readWorkingContent, WorkingCopyQueryError
 } from './svn';
@@ -17,6 +17,7 @@ const labels: Record<string, string> = {
 function label(change: Change): string {
   if (change.conflicted) return '冲突';
   if (['normal', 'none'].includes(change.item)) return '属性已修改';
+  if (change.item === 'deleted' && change.kind === 'dir') return '已删除（整个目录）';
   const text = labels[change.item] ?? `SVN 状态：${change.item}`;
   return change.props === 'modified' ? `${text}（含属性）` : text;
 }
@@ -59,14 +60,25 @@ function showChanges(view: WorkingCopyView, changes: Change[]): void {
   view.selected.reconcile([...view.ancestors, ...changes]);
   const byLabel = new Map<string, vscode.SourceControlResourceState[]>();
   for (const change of changes) {
-    const name = view.selected.has(change.path) ? '待提交' : view.selected.isDependency(change.path) ? '必需提交依赖' : label(change);
-    const states = byLabel.get(name) ?? [];
+    // Children of a scheduled-deletion directory are affected items of that one
+    // operation, shown for review even when the directory itself is selected.
+    const root = change.item === 'deleted' ? deletedTreeRoot(change.path, changes) : undefined;
+    const base = root ? '已删除子项' : label(change);
+    const text = view.selected.has(change.path) ? '待提交' : view.selected.isDependency(change.path) ? '必需提交依赖' : base;
+    const notes: string[] = [];
+    if (view.selected.isDependency(change.path)) notes.push('必需提交依赖（随选定子项一起提交）');
+    if (root) notes.push(`随整个目录删除（${path.relative(view.scm.rootUri!.fsPath, root.path) || path.basename(root.path)}）一起提交`);
+    if (!root && change.item === 'deleted' && change.kind === 'dir') {
+      const count = changes.filter(other => other !== change && other.item === 'deleted' && within(change.path, other.path)).length;
+      notes.push(count > 0 ? `含 ${count} 个受影响子项` : '整个子树没有其他受影响子项');
+    }
+    const states = byLabel.get(text) ?? [];
     states.push({
       resourceUri: vscode.Uri.file(change.path),
-      decorations: { tooltip: `${label(change)}${view.selected.isDependency(change.path) ? ' · 必需提交依赖（随选定子项一起提交）' : ''}`, strikeThrough: ['deleted', 'missing'].includes(change.item) },
+      decorations: { tooltip: [base, ...notes].join(' · '), strikeThrough: ['deleted', 'missing'].includes(change.item) },
       command: { command: 'codeSvn.viewChange', title: '查看差异', arguments: [change] }
     });
-    byLabel.set(name, states);
+    byLabel.set(text, states);
   }
   for (const [name, states] of byLabel) {
     if (!view.groups.has(name)) {
@@ -107,13 +119,31 @@ export function activate(context: vscode.ExtensionContext): void {
     try {
       await refresh();
       const choices = [...views.values()].flatMap(view => {
-        const paths = remove ? view.selected.explicitTargets : view.changes.filter(change => !view.selected.has(change.path)).map(change => change.path);
+        const paths = remove ? view.selected.explicitTargets : view.changes
+          // Never offer the misleading per-child splitting of a whole-tree deletion.
+          .filter(change => !view.selected.has(change.path) && !deletedTreeRoot(change.path, view.changes))
+          .map(change => change.path);
         return paths.map(target => ({ label: path.basename(target), description: `${view.scm.rootUri!.fsPath} · ${path.relative(view.scm.rootUri!.fsPath, target)}`, view, target }));
       });
       const choice = resource?.resourceUri
         ? choices.find(item => pathKey(item.target) === pathKey(resource.resourceUri.fsPath))
         : await vscode.window.showQuickPick(choices, { placeHolder: remove ? '选择要移出待提交的文件' : '选择要加入待提交的完整文件' });
-      if (!choice) return;
+      if (!choice) {
+        // Deleted children are excluded from the pick list; a resource-row click
+        // on one must guide to the whole-directory operation instead of failing
+        // silently or pretending the child is a separate commit.
+        if (!remove && resource?.resourceUri) {
+          for (const view of views.values()) {
+            const change = view.changes.find(item => pathKey(item.path) === pathKey(resource.resourceUri.fsPath));
+            if (!change) continue;
+            const treeRoot = deletedTreeRoot(change.path, view.changes);
+            if (treeRoot) {
+              throw new Error(`${path.basename(change.path)} 随整个目录删除，不能单独提交受影响子项；请选择目录 ${path.relative(view.scm.rootUri!.fsPath, treeRoot.path) || path.basename(treeRoot.path)} 本身，以整个子树为一次操作提交。`);
+            }
+          }
+        }
+        return;
+      }
       const key = pathKey(choice.view.scm.rootUri!.fsPath);
       if (views.get(key) !== choice.view) throw new Error('工作副本或管理范围已变化，请重新选择。');
       if (writes.isBusy(key)) throw new Error('该工作副本正在执行写操作，请等待完成。');
@@ -238,6 +268,12 @@ export function activate(context: vscode.ExtensionContext): void {
           await vscode.window.showTextDocument(vscode.Uri.file(change.path));
         }
         void vscode.window.showInformationMessage(`${name}：未跟踪文件尚未加入 SVN，没有 SVN 差异可比较；已打开${working.symbolicLink ? '链接目标' : '本地文件内容'}。`);
+        return;
+      }
+      // A scheduled-deletion directory has no text or property comparison to
+      // show; its subtree scope is presented by the change list.
+      if (change.item === 'deleted' && change.kind === 'dir') {
+        void vscode.window.showInformationMessage(`${name}：整个目录删除。受影响子项以「已删除子项」展示，随目录一起提交。`);
         return;
       }
       const content = await readDifference(executable, folder.uri.fsPath, change);

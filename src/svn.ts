@@ -10,6 +10,7 @@ export interface Change {
   props: string;
   conflicted: boolean;
   copied?: boolean;
+  kind?: 'file' | 'dir';
 }
 
 export interface PropertyValue {
@@ -149,7 +150,28 @@ async function readStatus(executable: string, folder: string, targets = ['.'], d
     if (!conflicted && ['normal', 'none', 'ignored'].includes(item) && ['none', 'normal'].includes(props)) return [];
     return [{ path: target, item, props, conflicted, copied: wcStatus['@_copied'] === 'true' }];
   });
+  await attachKinds(executable, folder, changes);
   return changes;
+}
+
+// Status never marks file versus directory. Scheduled deletions vanish from
+// disk, so only svn info can tell a whole-tree deletion from a deleted file.
+// Unknown kinds keep deleted items closed; never guess a whole-tree scope.
+async function attachKinds(executable: string, folder: string, changes: Change[]): Promise<void> {
+  const deleted = changes.filter(change => change.item === 'deleted');
+  if (deleted.length === 0) return;
+  const kinds = new Map<string, string>();
+  try {
+    const info = parse(await run(executable, folder, ['info', '--xml', '--',
+      ...deleted.map(change => `${path.relative(folder, change.path) || '.'}@`)]));
+    for (const entry of toArray(info.info?.entry)) kinds.set(path.resolve(folder, entry['@_path']), entry['@_kind']);
+  } catch {
+    return;
+  }
+  for (const change of deleted) {
+    const kind = kinds.get(change.path);
+    if (kind === 'dir' || kind === 'file') change.kind = kind;
+  }
 }
 
 function toArray(value: unknown): any[] {
