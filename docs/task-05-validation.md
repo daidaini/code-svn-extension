@@ -57,6 +57,9 @@ CLI 为 `codex-cli 0.155.1`，登录方式为 ChatGPT。默认配置模型 `gpt-
 单独使用同一模型重试一次仍失败。该轴不能记为通过或零问题。
 本地失败日志：`.test-artifacts/task05-codex-standards-final.jsonl`。
 
+用户已确认任务 05 不再补做独立审查：该轴记为用户豁免，不作为审查通过。
+后续任务审查改用 Codex 的 `gpt-6-luna`，已在根目录 `AGENTS.md` 记录。
+
 ### Spec
 
 只读 Codex 审查正常结束，退出码 0，发现 0 项需求缺失、范围扩张或错误实现。
