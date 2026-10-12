@@ -14,6 +14,12 @@ class SvnError extends Error {
   constructor(message: string, readonly stderr: string) { super(message); }
 }
 
+export class WorkingCopyQueryError extends Error {
+  constructor(readonly root: string, cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause), { cause });
+  }
+}
+
 function run(executable: string, cwd: string, args: string[]): Promise<string> {
   return new Promise((resolve, reject) => {
     execFile(executable, [...args, '--non-interactive'], {
@@ -58,6 +64,15 @@ export async function readChanges(executable: string, folder: string): Promise<{
   if (!info.info?.entry?.[0]?.['wc-info']?.['wcroot-abspath']) {
     throw new Error('SVN 未返回工作副本信息，无法确认管理范围。');
   }
+  const root = path.normalize(info.info.entry[0]['wc-info']['wcroot-abspath']);
+  try {
+    return { root, changes: await readStatus(executable, folder) };
+  } catch (error) {
+    throw new WorkingCopyQueryError(root, error);
+  }
+}
+
+async function readStatus(executable: string, folder: string): Promise<Change[]> {
   const status = parse(await run(executable, folder, ['status', '--xml', '--verbose', '--ignore-externals', '.']));
   if (!status.status) throw new Error('SVN 未返回状态信息，无法确认变更。');
   const entries = [
@@ -92,5 +107,5 @@ export async function readChanges(executable: string, folder: string): Promise<{
     if (!conflicted && ['normal', 'none', 'ignored'].includes(item) && ['none', 'normal'].includes(props)) return [];
     return [{ path: target, item, props, conflicted }];
   });
-  return { root: path.normalize(info.info.entry[0]['wc-info']['wcroot-abspath']), changes };
+  return changes;
 }

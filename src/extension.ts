@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import * as path from 'node:path';
-import { Change, readChanges } from './svn';
+import { Change, readChanges, WorkingCopyQueryError } from './svn';
 
 const labels: Record<string, string> = {
   modified: '已修改', added: '已添加', deleted: '已删除', missing: '本地缺失',
@@ -106,7 +106,8 @@ export function activate(context: vscode.ExtensionContext): void {
       const folder = folders[index];
       if (result.status === 'fulfilled' && result.value === undefined) return;
       const root = result.status === 'fulfilled' ? result.value!.root
-        : knownRoots.get(folder.uri.toString()) ?? folder.uri.fsPath;
+        : result.reason instanceof WorkingCopyQueryError ? result.reason.root
+          : knownRoots.get(folder.uri.toString()) ?? folder.uri.fsPath;
       const key = pathKey(root);
       nextRoots.set(folder.uri.toString(), root);
       if (!copies.has(key)) copies.set(key, { root, folders: [], changes: new Map(), errors: [] });

@@ -6,15 +6,17 @@ const { fixture, host, svn, eventually, cleanup } = require('./host.cjs');
 
 test('不同工作副本在混合工作区独立展示，不接管普通目录', { timeout: 90000 }, async () => {
   const a = await fixture();
-  const b = await fixture();
   let ui;
   try {
+    const second = path.join(a.root, '另一工作副本');
+    svn(a.root, 'checkout', a.url, second);
+    const secondScope = path.join(second, '中文 空格 @目录');
     await fs.writeFile(path.join(a.scope, '副本甲.txt'), 'a\n');
-    await fs.writeFile(path.join(b.scope, '副本乙.txt'), 'b\n');
+    await fs.writeFile(path.join(secondScope, '副本乙.txt'), 'b\n');
     const plain = path.join(a.root, 'plain');
     await fs.mkdir(plain);
     await fs.writeFile(path.join(plain, '不应管理.txt'), 'plain\n');
-    ui = await host(a.root, [plain, a.scope, b.scope], { 'scm.alwaysShowRepositories': true });
+    ui = await host(a.root, [plain, a.scope, secondScope], { 'scm.alwaysShowRepositories': true });
     await ui.command('SVN：刷新变更');
     await eventually(async () => {
       const list = await ui.scmText();
@@ -26,7 +28,42 @@ test('不同工作副本在混合工作区独立展示，不接管普通目录',
     });
   } finally {
     if (ui) await ui.close();
-    await cleanup(a.root); await cleanup(b.root);
+    await cleanup(a.root);
+  }
+});
+
+test('首次状态查询失败仍将已识别的同一工作副本归为一个管理项', { timeout: 90000 }, async () => {
+  const f = await fixture();
+  let ui;
+  try {
+    const sibling = path.join(f.wc, 'sibling');
+    await fs.appendFile(path.join(sibling, 'outside.txt'), 'local\n');
+    const infoScope = svn(f.scope, 'info', '--xml', '.');
+    const infoSibling = svn(sibling, 'info', '--xml', '.');
+    const statusSibling = svn(sibling, 'status', '--xml', '--verbose', '--ignore-externals', '.');
+    await fs.writeFile(path.join(f.scope, 'info'), `process.stdout.write(${JSON.stringify(infoScope)});`);
+    await fs.writeFile(path.join(f.scope, 'status'), 'process.stderr.write("svn: warning: W155007: status unavailable\\n");');
+    await fs.writeFile(path.join(sibling, 'info'), `process.stdout.write(${JSON.stringify(infoSibling)});`);
+    await fs.writeFile(path.join(sibling, 'status'), `process.stdout.write(${JSON.stringify(statusSibling)});`);
+    ui = await host(f.root, [f.scope, sibling], {
+      'scm.alwaysShowRepositories': true, 'codeSvn.svnPath': process.execPath
+    });
+    await ui.command('SVN：刷新变更');
+    await eventually(async () => {
+      const list = await ui.scmText();
+      assert.match(list, /SVN：查询失败/);
+      assert.equal(await ui.page.locator('.scm-view .scm-provider').count(), 1, list);
+    }, 5000);
+    await ui.settings({ 'codeSvn.svnPath': 'svn' });
+    await eventually(async () => {
+      const list = await ui.scmText();
+      assert.match(list, /outside\.txt/);
+      assert.doesNotMatch(list, /SVN：查询失败/);
+      assert.equal(await ui.page.locator('.scm-view .scm-provider').count(), 1, list);
+    });
+  } finally {
+    if (ui) await ui.close();
+    await cleanup(f.root);
   }
 });
 
