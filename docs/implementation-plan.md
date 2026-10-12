@@ -1,7 +1,7 @@
 # 首版实施与验收
 
 依据 [首版设计](./design.md)。任务顺序已确认；按 `docs/ticket-drafts/` 中的 01–15 顺序逐项实现，每项完成后等待用户确认继续。
-任务 01 已实现单目录状态展示与刷新，验证见 [task-01-validation.md](./task-01-validation.md)；多根工作区与后续功能、安装包及双环境完整验收尚未完成。
+任务 01–02 已实现状态展示、刷新与多根工作区，验证见 [task-01-validation.md](./task-01-validation.md) 和 [task-02-validation.md](./task-02-validation.md)；后续功能、安装包及双环境完整验收尚未完成。
 
 用户授权的真实验证工作副本为 `E:\WorkCode\BizDocs`，用于只读识别、状态、差异和历史查询；写操作使用隔离测试仓库。已有 CLI 验证结果见 [svn-validation.md](./svn-validation.md)，不据此勾选插件验收项。
 

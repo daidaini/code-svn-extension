@@ -30,6 +30,14 @@ async function fixture() {
 }
 
 async function host(root, folder, settings = {}) {
+  const workspaceFile = path.join(root, 'test.code-workspace');
+  async function setFolders(folders) {
+    await fs.writeFile(workspaceFile, JSON.stringify({ folders: folders.map(folder => ({ path: folder })) }));
+  }
+  if (Array.isArray(folder)) {
+    await setFolders(folder);
+    folder = workspaceFile;
+  }
   const profile = path.join(root, 'profile');
   await fs.mkdir(path.join(profile, 'User'), { recursive: true });
   await fs.writeFile(path.join(profile, 'User', 'settings.json'), JSON.stringify({
@@ -69,6 +77,7 @@ async function host(root, folder, settings = {}) {
     });
     return {
       page,
+      folders: setFolders,
       async settings(values) {
         const file = path.join(profile, 'User', 'settings.json');
         const current = JSON.parse(await fs.readFile(file, 'utf8'));

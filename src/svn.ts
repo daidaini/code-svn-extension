@@ -47,7 +47,7 @@ function within(folder: string, target: string): boolean {
 
 // Use cwd plus "." so spaces, Unicode and @ in opened directory names never
 // become shell text or SVN peg revisions. No parent/sibling status query.
-export async function readChanges(executable: string, folder: string): Promise<Change[] | undefined> {
+export async function readChanges(executable: string, folder: string): Promise<{ root: string; changes: Change[] } | undefined> {
   let info;
   try {
     info = parse(await run(executable, folder, ['info', '--xml', '.']));
@@ -81,7 +81,7 @@ export async function readChanges(executable: string, folder: string): Promise<C
       }
     }
   }
-  return entries.flatMap((entry: any): Change[] => {
+  const changes = entries.flatMap((entry: any): Change[] => {
     const target = path.resolve(folder, entry['@_path']);
     const wcStatus = entry['wc-status'];
     if (!wcStatus) throw new Error('SVN 返回了缺少工作状态的条目。');
@@ -92,4 +92,5 @@ export async function readChanges(executable: string, folder: string): Promise<C
     if (!conflicted && ['normal', 'none', 'ignored'].includes(item) && ['none', 'normal'].includes(props)) return [];
     return [{ path: target, item, props, conflicted }];
   });
+  return { root: path.normalize(info.info.entry[0]['wc-info']['wcroot-abspath']), changes };
 }
