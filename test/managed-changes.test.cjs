@@ -99,6 +99,36 @@ test('非 SVN 目录不显示 SVN 管理项', { timeout: 90000 }, async () => {
   }
 });
 
+test('SVN 状态命令退出码为零但带查询警告时，明确失败并保留旧列表', { timeout: 90000 }, async () => {
+  const f = await fixture();
+  let ui;
+  try {
+    await fs.appendFile(path.join(f.scope, '修改 中文.txt'), 'changed\n');
+    ui = await host(f.root, f.scope);
+    await ui.command('SVN：刷新变更');
+    await eventually(async () => assert.match(await ui.scmText(), /修改 中文\.txt/));
+    // CLI environment fixture models metadata disappearing between info and
+    // status. It preserves the real info response, then emits SVN's zero-exit
+    // W155007 response. No extension functions or collaborators are mocked.
+    const info = svn(f.scope, 'info', '--xml', '.');
+    await fs.writeFile(path.join(f.scope, 'info'), `process.stdout.write(${JSON.stringify(info)});`);
+    await fs.writeFile(path.join(f.scope, 'status'),
+      'process.stderr.write("svn: warning: W155007: not a working copy\\n");' +
+      'process.stdout.write("<?xml version=\\"1.0\\"?><status><target path=\\".\\"></target></status>");');
+    // Node runs the cwd's info/status scripts using the unchanged public CLI
+    // arguments, so this fixture also works without a shell or .cmd shim.
+    await ui.settings({ 'codeSvn.svnPath': process.execPath });
+    await ui.command('SVN：刷新变更');
+    await eventually(async () => {
+      assert.match(await ui.page.locator('.statusbar').innerText(), /SVN：查询失败（列表未更新）/);
+      assert.match(await ui.scmText(), /修改 中文\.txt/);
+    }, 5000);
+  } finally {
+    if (ui) await ui.close();
+    await cleanup(f.root);
+  }
+});
+
 test('SCM 显示属性、未跟踪和冲突，排除目录 externals、文件 externals 与嵌套工作副本', { timeout: 90000 }, async () => {
   const f = await fixture();
   let ui;

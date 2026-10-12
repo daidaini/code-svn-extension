@@ -19,8 +19,10 @@ function run(executable: string, cwd: string, args: string[]): Promise<string> {
     execFile(executable, [...args, '--non-interactive'], {
       cwd, encoding: 'utf8', windowsHide: true, timeout: 20000, maxBuffer: 32 * 1024 * 1024
     }, (error, stdout, stderr) => {
-      if (error) {
-        reject(new SvnError(`SVN 查询失败：${stderr.trim() || error.message}`, stderr));
+      // SVN can return exit 0 with warnings and an incomplete/empty status.
+      // Such a result cannot establish that the managed scope is clean.
+      if (error || stderr.trim()) {
+        reject(new SvnError(`SVN 查询失败：${stderr.trim() || error?.message}`, stderr));
       } else {
         resolve(stdout);
       }
