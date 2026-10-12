@@ -47,11 +47,33 @@ export class CommitSelection {
     return parents;
   }
 
+  // A recorded move is one operation: SVN refuses to commit either side alone,
+  // so the scheduled source deletion joins as a required dependency.
+  private moveSources(target: string): string[] {
+    const change = this.changes.get(pathKey(target));
+    if (!change?.movedFrom) return [];
+    const source = this.changes.get(pathKey(change.movedFrom));
+    return source?.item === 'deleted' ? [source.path] : [];
+  }
+
+  // A move whose source is not a known scheduled deletion lies outside the
+  // managed scope: both sides could never be committed together there.
+  private requireMoveSource(target: string): void {
+    const change = this.changes.get(pathKey(target));
+    if (!change?.movedFrom) return;
+    const source = this.changes.get(pathKey(change.movedFrom));
+    if (!source || source.item !== 'deleted') {
+      const shown = path.relative(this.root, change.movedFrom) || path.basename(change.movedFrom);
+      throw new Error(`${path.basename(target)} 的移动源 ${shown} 不在当前管理范围内，无法一起提交；请将源所在目录加入工作区后重新选择。`);
+    }
+  }
+
   reconcile(changes: Change[]): void {
     this.changes = new Map(changes.map(change => [pathKey(change.path), change]));
     this.dependencies.clear();
     for (const target of this.files.values()) {
       for (const parent of this.parents(target)) this.dependencies.set(pathKey(parent), parent);
+      for (const source of this.moveSources(target)) this.dependencies.set(pathKey(source), source);
     }
   }
 
@@ -66,15 +88,22 @@ export class CommitSelection {
     if (change.item === 'unversioned') throw new Error(`${path.basename(change.path)} 尚未跟踪，请先执行添加到版本控制，再加入待提交。`);
     if (change.item === 'deleted') {
       // The scheduled directory may already be gone from disk; committing its
-      // node deletes the whole subtree as one operation.
-      if (change.kind === 'dir') return;
+      // node deletes the whole subtree as one operation. A recorded move's
+      // source commits only together with its selected target.
+      if (change.kind === 'dir' && !change.movedTo) return;
+      if (change.movedTo) {
+        const target = this.changes.get(pathKey(change.movedTo));
+        if (target && this.files.has(pathKey(target.path))) return;
+      }
       throw new Error(`${path.basename(change.path)} 的当前状态不支持提交。删除操作尚未开放。`);
     }
     if (!['modified', 'normal', 'added'].includes(change.item) || (change.item === 'normal' && change.props !== 'modified')) {
       throw new Error(`${path.basename(change.path)} 的当前状态不支持提交。删除操作尚未开放。`);
     }
     const stat = await fs.lstat(change.path);
-    if (stat.isDirectory() && change.item === 'added' && !change.copied) return;
+    // Copies commit recursively in the repository even at depth empty; plain
+    // and copied directories alike commit as the one operation the user chose.
+    if (stat.isDirectory() && change.item === 'added') return;
     // Directory property commits carry --depth empty: only the directory's own
     // properties are sent, never the children's changes.
     if (stat.isDirectory() && change.props === 'modified' && ['modified', 'normal'].includes(change.item)) return;
@@ -93,6 +122,7 @@ export class CommitSelection {
   async add(change: Change, scopes: string[]): Promise<void> {
     this.checkScope(change.path, scopes);
     await this.checkFile(change);
+    this.requireMoveSource(change.path);
     for (const parent of this.parents(change.path)) {
       this.checkScope(parent, scopes);
       await this.checkFile(this.changes.get(pathKey(parent))!);

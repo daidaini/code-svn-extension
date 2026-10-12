@@ -18,6 +18,7 @@ function label(change: Change): string {
   if (change.conflicted) return '冲突';
   if (['normal', 'none'].includes(change.item)) return '属性已修改';
   if (change.item === 'deleted' && change.kind === 'dir') return '已删除（整个目录）';
+  if (change.item === 'added' && change.copied) return change.movedFrom ? '已移动' : '已复制';
   const text = labels[change.item] ?? `SVN 状态：${change.item}`;
   return change.props === 'modified' ? `${text}（含属性）` : text;
 }
@@ -72,6 +73,14 @@ function showChanges(view: WorkingCopyView, changes: Change[]): void {
       const count = changes.filter(other => other !== change && other.item === 'deleted' && within(change.path, other.path)).length;
       notes.push(count > 0 ? `含 ${count} 个受影响子项` : '整个子树没有其他受影响子项');
     }
+    if (change.item === 'added' && change.copied) {
+      if (change.movedFrom) notes.push(`自 ${path.relative(view.scm.rootUri!.fsPath, change.movedFrom) || path.basename(change.movedFrom)}`);
+      else if (change.copiedFrom) notes.push(`自 ^${change.copiedFrom.repoPath}`);
+      if (change.kind === 'dir') notes.push('整个复制子树随目录一起提交');
+    }
+    if (change.item === 'deleted' && change.movedTo) {
+      notes.push(`已移动到 ${path.relative(view.scm.rootUri!.fsPath, change.movedTo) || path.basename(change.movedTo)}（随目标一起提交）`);
+    }
     const states = byLabel.get(text) ?? [];
     states.push({
       resourceUri: vscode.Uri.file(change.path),
@@ -120,8 +129,10 @@ export function activate(context: vscode.ExtensionContext): void {
       await refresh();
       const choices = [...views.values()].flatMap(view => {
         const paths = remove ? view.selected.explicitTargets : view.changes
-          // Never offer the misleading per-child splitting of a whole-tree deletion.
-          .filter(change => !view.selected.has(change.path) && !deletedTreeRoot(change.path, view.changes))
+          // Never offer the misleading per-child splitting of a whole-tree
+          // deletion, or the source side of a recorded move.
+          .filter(change => !view.selected.has(change.path)
+            && !(change.item === 'deleted' && (deletedTreeRoot(change.path, view.changes) || change.movedTo)))
           .map(change => change.path);
         return paths.map(target => ({ label: path.basename(target), description: `${view.scm.rootUri!.fsPath} · ${path.relative(view.scm.rootUri!.fsPath, target)}`, view, target }));
       });
@@ -129,16 +140,24 @@ export function activate(context: vscode.ExtensionContext): void {
         ? choices.find(item => pathKey(item.target) === pathKey(resource.resourceUri.fsPath))
         : await vscode.window.showQuickPick(choices, { placeHolder: remove ? '选择要移出待提交的文件' : '选择要加入待提交的完整文件' });
       if (!choice) {
-        // Deleted children are excluded from the pick list; a resource-row click
-        // on one must guide to the whole-directory operation instead of failing
-        // silently or pretending the child is a separate commit.
+        // Excluded items are not choices: a resource-row click on one must
+        // guide to the operation that owns it instead of failing silently or
+        // pretending it is a separate commit.
         if (!remove && resource?.resourceUri) {
           for (const view of views.values()) {
             const change = view.changes.find(item => pathKey(item.path) === pathKey(resource.resourceUri.fsPath));
-            if (!change) continue;
-            const treeRoot = deletedTreeRoot(change.path, view.changes);
-            if (treeRoot) {
-              throw new Error(`${path.basename(change.path)} 随整个目录删除，不能单独提交受影响子项；请选择目录 ${path.relative(view.scm.rootUri!.fsPath, treeRoot.path) || path.basename(treeRoot.path)} 本身，以整个子树为一次操作提交。`);
+            if (!change || change.item !== 'deleted') continue;
+            const dir = deletedTreeRoot(change.path, view.changes) ?? (change.kind === 'dir' ? change : undefined);
+            const movedTo = dir?.movedTo ?? change.movedTo;
+            if (movedTo) {
+              const target = view.changes.find(item => pathKey(item.path) === pathKey(movedTo));
+              const shown = target
+                ? path.relative(view.scm.rootUri!.fsPath, target.path) || path.basename(target.path)
+                : path.relative(view.scm.rootUri!.fsPath, movedTo) || path.basename(movedTo);
+              throw new Error(`${path.basename(change.path)} 已记录移动到 ${shown}，请选择移动后的目标提交这次移动；源会作为必需提交依赖一起提交。`);
+            }
+            if (dir) {
+              throw new Error(`${path.basename(change.path)} 随整个目录删除，不能单独提交受影响子项；请选择目录 ${path.relative(view.scm.rootUri!.fsPath, dir.path) || path.basename(dir.path)} 本身，以整个子树为一次操作提交。`);
             }
           }
         }

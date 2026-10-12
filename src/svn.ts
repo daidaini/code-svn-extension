@@ -4,6 +4,12 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import { XMLParser, XMLValidator } from 'fast-xml-parser';
 
+export interface CopySource {
+  url: string;
+  rev: number;
+  repoPath: string;
+}
+
 export interface Change {
   path: string;
   item: string;
@@ -11,6 +17,9 @@ export interface Change {
   conflicted: boolean;
   copied?: boolean;
   kind?: 'file' | 'dir';
+  movedFrom?: string;
+  movedTo?: string;
+  copiedFrom?: CopySource;
 }
 
 export interface PropertyValue {
@@ -148,29 +157,61 @@ async function readStatus(executable: string, folder: string, targets = ['.'], d
     const conflicted = item === 'conflicted' || props === 'conflicted' || wcStatus['@_tree-conflicted'] === 'true';
     if (excluded.some(excludedPath => within(excludedPath, target))) return [];
     if (!conflicted && ['normal', 'none', 'ignored'].includes(item) && ['none', 'normal'].includes(props)) return [];
-    return [{ path: target, item, props, conflicted, copied: wcStatus['@_copied'] === 'true' }];
+    // Move relationships are relative to the queried folder, with .. for
+    // sources outside it; resolve them once against that folder.
+    const movedFrom = typeof wcStatus['@_moved-from'] === 'string' ? path.resolve(folder, wcStatus['@_moved-from']) : undefined;
+    const movedTo = typeof wcStatus['@_moved-to'] === 'string' ? path.resolve(folder, wcStatus['@_moved-to']) : undefined;
+    return [{ path: target, item, props, conflicted, copied: wcStatus['@_copied'] === 'true', movedFrom, movedTo }];
   });
-  await attachKinds(executable, folder, changes);
+  await attachInfo(executable, folder, changes);
   return changes;
 }
 
-// Status never marks file versus directory. Scheduled deletions vanish from
-// disk, so only svn info can tell a whole-tree deletion from a deleted file.
-// Unknown kinds keep deleted items closed; never guess a whole-tree scope.
-async function attachKinds(executable: string, folder: string, changes: Change[]): Promise<void> {
-  const deleted = changes.filter(change => change.item === 'deleted');
-  if (deleted.length === 0) return;
-  const kinds = new Map<string, string>();
+// Status never marks file versus directory, and plain copies carry no source.
+// Scheduled deletions vanish from disk, so only svn info can tell a whole-tree
+// deletion from a deleted file and report where a copy came from. Copy history
+// lives on the copied root; nested items take their base from the nearest
+// copied ancestor's source plus their relative path inside it.
+async function attachInfo(executable: string, folder: string, changes: Change[]): Promise<void> {
+  const targets = changes.filter(change => change.item === 'deleted' || change.copied);
+  if (targets.length === 0) return;
+  const entries = new Map<string, any>();
   try {
     const info = parse(await run(executable, folder, ['info', '--xml', '--',
-      ...deleted.map(change => `${path.relative(folder, change.path) || '.'}@`)]));
-    for (const entry of toArray(info.info?.entry)) kinds.set(path.resolve(folder, entry['@_path']), entry['@_kind']);
+      ...targets.map(change => `${path.relative(folder, change.path) || '.'}@`)]));
+    for (const entry of toArray(info.info?.entry)) entries.set(path.resolve(folder, entry['@_path']), entry);
   } catch {
     return;
   }
-  for (const change of deleted) {
-    const kind = kinds.get(change.path);
-    if (kind === 'dir' || kind === 'file') change.kind = kind;
+  for (const change of targets) {
+    const entry = entries.get(change.path);
+    if (!entry) continue;
+    if (change.item === 'deleted') {
+      const kind = entry['@_kind'];
+      if (kind === 'dir' || kind === 'file') change.kind = kind;
+    }
+    const url = entry['wc-info']?.['copy-from-url'];
+    if (change.copied && typeof url === 'string' && url) {
+      const root = entry['repository']?.['root'];
+      const repoPath = typeof root === 'string' && url.startsWith(root) ? url.slice(root.length) : url;
+      change.copiedFrom = { url, rev: Number(entry['wc-info']?.['copy-from-rev']) || 0, repoPath };
+    }
+  }
+  for (const change of targets.filter(candidate => candidate.copied && !candidate.copiedFrom)) {
+    let ancestor: Change | undefined;
+    for (const other of changes) {
+      if (other === change || !other.copiedFrom || other.item !== 'added') continue;
+      if (!within(other.path, change.path)) continue;
+      if (!ancestor || within(ancestor.path, other.path)) ancestor = other;
+    }
+    if (!ancestor?.copiedFrom) continue;
+    const relative = path.relative(ancestor.path, change.path).split(path.sep).join('/');
+    if (!relative) continue;
+    change.copiedFrom = {
+      url: `${ancestor.copiedFrom.url}/${relative}`,
+      rev: ancestor.copiedFrom.rev,
+      repoPath: `${ancestor.copiedFrom.repoPath}/${relative}`
+    };
   }
 }
 
@@ -211,8 +252,11 @@ async function readLocal(target: string): Promise<{ bytes?: Buffer; symbolicLink
   }
 }
 
-async function catBase(executable: string, dir: string, name: string): Promise<Buffer | undefined> {
+async function catBase(executable: string, dir: string, name: string, copiedFrom?: CopySource): Promise<Buffer | undefined> {
   try {
+    // A copy's honest before-side is its copy-from revision, matching the diff
+    // SVN itself shows; a copied item has no BASE of its own.
+    if (copiedFrom) return await exec(executable, dir, ['cat', '-r', String(copiedFrom.rev), '--', copiedFrom.url]);
     return await exec(executable, dir, ['cat', '-r', 'BASE', '--', `${name}@`]);
   } catch (error) {
     if (error instanceof SvnError && noContentTarget.test(error.stderr)) return undefined;
@@ -226,7 +270,7 @@ export async function readWorkingContent(target: string): Promise<WorkingContent
 }
 
 async function readContent(executable: string, folder: string, change: Change): Promise<WorkingContent & { base?: string }> {
-  const base = await catBase(executable, folder, path.relative(folder, change.path) || '.');
+  const base = await catBase(executable, folder, path.relative(folder, change.path) || '.', change.copiedFrom);
   const bytes = change.item === 'deleted' ? undefined : (await readLocal(change.path)).bytes;
   return {
     base: asText(base),
@@ -258,8 +302,13 @@ async function propertyMap(executable: string, dir: string, args: string[]): Pro
 // console encoding, so it cannot carry Chinese paths into the editor intact.
 export async function readDifference(executable: string, folder: string, change: Change): Promise<ChangeContent> {
   const name = path.relative(folder, change.path) || '.';
+  // A copy's property base is its copy-from revision, matching the diff SVN
+  // itself shows; otherwise properties compare against the item's own BASE.
+  const beforeArgs = change.copiedFrom
+    ? ['proplist', '--xml', '-v', '--depth', 'empty', '-r', String(change.copiedFrom.rev), '--', change.copiedFrom.url]
+    : ['proplist', '--xml', '-v', '--depth', 'empty', '-r', 'BASE', '--', `${name}@`];
   const [before, after] = await Promise.all([
-    propertyMap(executable, folder, ['proplist', '--xml', '-v', '--depth', 'empty', '-r', 'BASE', '--', `${name}@`]),
+    propertyMap(executable, folder, beforeArgs),
     propertyMap(executable, folder, ['proplist', '--xml', '-v', '--depth', 'empty', '--', `${name}@`])
   ]);
   const changes: PropertyChange[] = [];
