@@ -2,13 +2,16 @@ import * as vscode from 'vscode';
 import * as path from 'node:path';
 import { CommitSelection, WorkingCopyWrites, deletedTreeRoot, pathKey, within } from './commit-selection';
 import {
-  Change, HistoryEntry, PropertyChange, PropertyValue, QueryCancelled, addPath, commitFiles, historyBatchSize, readChanges, readDifference,
-  readHistoryBatch, readObjectUrl, readWorkingContent, revertChanges, updateScopes, WorkingCopyQueryError
+  Change, HistoryEntry, ObjectLocation, PropertyChange, PropertyValue, QueryCancelled, RevisionPath, addPath, commitFiles, historyBatchSize,
+  readChanges, readDifference, readHistoryBatch, readObjectLocation, readRevisionDifference, readRevisionPaths, readWorkingContent,
+  revertChanges, updateScopes, WorkingCopyQueryError
 } from './svn';
 
 // Local and base content reach the diff editor through this scheme so a deleted
 // side, a directory and an added item all have something honest to show.
 const contentScheme = 'codeSvn';
+// Historical sides are read-only documents keyed by revision, outside any working copy.
+const revisionScheme = 'codeSvnRevision';
 
 const labels: Record<string, string> = {
   modified: '已修改', added: '已添加', deleted: '已删除', missing: '本地缺失',
@@ -43,6 +46,18 @@ function propertyText(changes: PropertyChange[], target: string): string {
 
 interface HistoryItem extends vscode.QuickPickItem {
   loadMore?: boolean;
+  revision?: number;
+}
+
+interface RevisionItem extends vscode.QuickPickItem {
+  change: RevisionPath;
+}
+
+const revisionActions: Record<string, string> = { A: '已添加', D: '已删除', M: '已修改', R: '已替换' };
+
+function revisionLabel(change: RevisionPath): string {
+  const text = revisionActions[change.action] ?? `SVN 变更：${change.action}`;
+  return `${text}${change.kind === 'dir' ? '（目录）' : ''}${change.propertyModified ? '（含属性）' : ''}`;
 }
 
 // Each failure names its own remedy. None of them may read as an empty history.
@@ -51,7 +66,7 @@ function historyFailure(detail: string): string {
   if (/E230001|certificate/i.test(detail)) return '证书校验失败：请在同一环境的终端确认并信任服务器证书后重试；插件不会忽略证书错误。';
   if (/E170013|E175002|Unable to connect|Connection refused/i.test(detail)) return '无法连接服务器：请检查网络、代理及仓库地址后重试。';
   if (/W155010|E155007|E155010|E200009/.test(detail)) return '该对象不在 SVN 版本控制中，没有可查询的历史。';
-  if (/E160013/.test(detail)) return '服务器上找不到该路径，可能尚未提交。';
+  if (/E160013/.test(detail)) return '服务器 HEAD 上找不到该路径：可能尚未提交，或本地工作副本落后且路径已被移动或删除，请更新后重试。';
   return '请检查 codeSvn.svnPath 设置及查询日志。';
 }
 
@@ -504,21 +519,25 @@ export function activate(context: vscode.ExtensionContext): void {
       return;
     }
     const executable = svnExecutable(folder);
+    const folderPath = folder.uri.fsPath;
     const controller = new AbortController();
     const picker = vscode.window.createQuickPick<HistoryItem>();
     const entries: HistoryEntry[] = [];
-    let url: string | undefined;
+    let location: ObjectLocation | undefined;
     let hasMore = true;
     let closed = false;
     picker.title = `SVN 历史：${name}`;
     picker.onDidHide(() => { closed = true; controller.abort(); picker.dispose(); });
     picker.onDidAccept(() => {
-      if (picker.selectedItems[0]?.loadMore && !picker.busy) void load();
+      const item = picker.selectedItems[0];
+      if (item?.loadMore && !picker.busy) void load();
+      else if (item?.revision !== undefined && location && !picker.busy) void showRevision(item.revision, location);
     });
     const render = () => {
       picker.items = [
         ...entries.map((entry): HistoryItem => ({
           label: `r${entry.revision}`,
+          revision: entry.revision,
           description: `${entry.author || '（无作者）'} · ${formatDate(entry.date)}`,
           detail: entry.message.replace(/\s+/g, ' ').trim() || '（无提交信息）'
         })),
@@ -529,9 +548,9 @@ export function activate(context: vscode.ExtensionContext): void {
     const load = async (): Promise<void> => {
       picker.busy = true;
       try {
-        url ??= await readObjectUrl(executable, folder.uri.fsPath, scope, controller.signal);
+        location ??= await readObjectLocation(executable, folder.uri.fsPath, scope, controller.signal);
         const last = entries[entries.length - 1];
-        const batch = await readHistoryBatch(executable, folder.uri.fsPath, url, last ? last.revision - 1 : undefined, controller.signal);
+        const batch = await readHistoryBatch(executable, folder.uri.fsPath, location.url, last ? last.revision - 1 : undefined, controller.signal);
         entries.push(...batch.entries);
         hasMore = batch.hasMore;
         if (entries.length === 0) {
@@ -553,6 +572,85 @@ export function activate(context: vscode.ExtensionContext): void {
         if (!closed) picker.busy = false;
       }
     };
+    async function showRevision(revision: number, target: ObjectLocation): Promise<void> {
+      picker.hide();
+      const detailController = new AbortController();
+      const changes = vscode.window.createQuickPick<RevisionItem>();
+      let closed = false;
+      changes.title = `r${revision} · ${name}`;
+      changes.onDidHide(() => { closed = true; detailController.abort(); changes.dispose(); });
+      changes.onDidAccept(() => {
+        const item = changes.selectedItems[0];
+        if (!item) return;
+        changes.hide();
+        void showRevisionDifference(revision, target, item.change);
+      });
+      changes.busy = true;
+      changes.placeholder = '正在查询该修订中影响此对象的变化…';
+      changes.show();
+      try {
+        const paths = await readRevisionPaths(executable, folderPath, target, revision, detailController.signal);
+        if (paths.length === 0) {
+          changes.hide();
+          void vscode.window.showInformationMessage(`r${revision} 没有影响 ${name} 的路径变化。`);
+          return;
+        }
+        changes.items = paths.map((change): RevisionItem => ({
+          label: `${revisionLabel(change)}  ${change.path}`,
+          description: change.copyFrom ? `来源 ^${change.copyFrom.path}@${change.copyFrom.revision}` : undefined,
+          change
+        }));
+        changes.placeholder = `${paths.length} 项影响此对象的变化，选择后查看提交前后内容`;
+      } catch (error) {
+        if (closed || error instanceof QueryCancelled) return;
+        const detail = error instanceof Error ? error.message : String(error);
+        output.appendLine(`${new Date().toISOString()} 查询修订变化失败 r${revision} ${scope}\n${detail}`);
+        changes.hide();
+        void vscode.window.showErrorMessage(`查询 r${revision} 的变化失败：${detail} ${historyFailure(detail)}`, '查看日志')
+          .then(action => { if (action === '查看日志') output.show(); });
+      } finally {
+        if (!closed) changes.busy = false;
+      }
+    }
+
+    async function showRevisionDifference(revision: number, target: ObjectLocation, change: RevisionPath): Promise<void> {
+      const label = path.basename(change.path);
+      try {
+        const content = await readRevisionDifference(executable, folderPath, target, revision, change);
+        const properties = content.properties;
+        const uri = (side: 'base' | 'after' | 'properties') => vscode.Uri.from({
+          scheme: revisionScheme, path: change.path, query: `r=${revision}&side=${side}`
+        });
+        for (const [side, text] of [
+          ['base', content.base ?? ''], ['after', content.text ?? ''],
+          ['properties', propertyText(properties, change.path)]
+        ] as const) {
+          documents.set(uri(side).toString(), text);
+          documentChanges.fire(uri(side));
+        }
+        if (properties.length > 0) await vscode.window.showTextDocument(uri('properties'), { preview: false });
+        if (content.binary) {
+          void vscode.window.showWarningMessage(`${label}：r${revision} ${revisionLabel(change)}，但 SVN 没有提供文本差异，二进制内容不可分析，本次没有分析文件内容。`);
+          return;
+        }
+        if (change.kind === 'dir' && properties.length === 0) {
+          void vscode.window.showInformationMessage(`${label}：目录条目没有文本或属性差异，其子项变化已单独列出。`);
+          return;
+        }
+        if (content.base === content.text) {
+          if (properties.length === 0) void vscode.window.showInformationMessage(`${label}：r${revision} 没有文本内容差异。`);
+          return;
+        }
+        await vscode.commands.executeCommand('vscode.diff', uri('base'), uri('after'),
+          `${label}（r${revision} · ${revisionLabel(change)} · SVN 历史差异）`);
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        output.appendLine(`${new Date().toISOString()} 查看历史差异失败 r${revision} ${change.path}\n${detail}`);
+        void vscode.window.showErrorMessage(`查看 ${label} 的历史差异失败：${detail} ${historyFailure(detail)}`, '查看日志')
+          .then(action => { if (action === '查看日志') output.show(); });
+      }
+    }
+
     picker.show();
     await load();
   }
@@ -685,6 +783,14 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.workspace.registerTextDocumentContentProvider(contentScheme, {
       onDidChange: documentChanges.event,
       provideTextDocumentContent: content
+    }),
+    vscode.workspace.registerTextDocumentContentProvider(revisionScheme, {
+      onDidChange: documentChanges.event,
+      provideTextDocumentContent: uri => {
+        const text = documents.get(uri.toString());
+        if (text === undefined) throw new Error('历史差异内容已关闭，请重新从历史列表打开。');
+        return text;
+      }
     }),
     vscode.workspace.onDidCloseTextDocument(document => { documents.delete(document.uri.toString()); }),
     vscode.workspace.onDidChangeWorkspaceFolders(() => { void refresh(); }),

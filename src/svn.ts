@@ -316,6 +316,11 @@ export async function readDifference(executable: string, folder: string, change:
     propertyMap(executable, folder, beforeArgs),
     propertyMap(executable, folder, ['proplist', '--xml', '-v', '--depth', 'empty', '--', `${name}@`])
   ]);
+  const content = await readContent(executable, folder, change);
+  return { ...content, binary: content.binary || isBinaryMime(before, after), properties: propertyChanges(before, after) };
+}
+
+function propertyChanges(before: Map<string, PropertyValue>, after: Map<string, PropertyValue>): PropertyChange[] {
   const changes: PropertyChange[] = [];
   for (const [property, value] of before) {
     if (!after.has(property)) changes.push({ name: property, before: value });
@@ -324,13 +329,15 @@ export async function readDifference(executable: string, folder: string, change:
     }
   }
   for (const [property, value] of after) if (!before.has(property)) changes.push({ name: property, after: value });
-  const content = await readContent(executable, folder, change);
-  // SVN treats these two image formats as text alongside text/* MIME types.
-  const binaryMime = [before, after].some(properties => {
+  return changes;
+}
+
+// SVN treats these two image formats as text alongside text/* MIME types.
+function isBinaryMime(...maps: Map<string, PropertyValue>[]): boolean {
+  return maps.some(properties => {
     const mime = properties.get('svn:mime-type')?.value;
     return mime !== undefined && !mime.startsWith('text/') && !['image/x-xbitmap', 'image/x-xpixmap'].includes(mime);
   });
-  return { ...content, binary: content.binary || binaryMime, properties: changes };
 }
 
 // Shallow explicit targets never traverse untracked files, externals or nested
@@ -380,13 +387,118 @@ export interface HistoryBatch {
 
 export const historyBatchSize = 50;
 
+export interface ObjectLocation {
+  url: string;
+  root: string;
+}
+
 // Object URL comes from the working copy's metadata; the history itself is
 // always queried from the server, so an outdated working copy cannot narrow it.
-export async function readObjectUrl(executable: string, folder: string, target: string, signal?: AbortSignal): Promise<string> {
+export async function readObjectLocation(executable: string, folder: string, target: string, signal?: AbortSignal): Promise<ObjectLocation> {
   const info = parse(await run(executable, folder, ['info', '--xml', '--', `${path.relative(folder, target) || '.'}@`], signal));
-  const url = info.info?.entry?.[0]?.url;
-  if (typeof url !== 'string' || !url) throw new Error('SVN 未返回对象地址，无法查询历史。');
-  return url;
+  const entry = info.info?.entry?.[0];
+  const url = entry?.url;
+  const root = entry?.repository?.root;
+  if (typeof url !== 'string' || !url || typeof root !== 'string' || !root) {
+    throw new Error('SVN 未返回对象地址，无法查询历史。');
+  }
+  return { url, root };
+}
+
+// Repository paths are decoded, so both sides of a lineage comparison match.
+function repoPathOf(location: ObjectLocation, url: string): string {
+  if (!url.startsWith(location.root)) throw new Error('SVN 返回了仓库之外的地址，无法追溯历史。');
+  return decodeURIComponent(url.slice(location.root.length));
+}
+
+function repoUrl(root: string, repoPath: string, revision: number): string {
+  return `${root}${repoPath.split('/').map(encodeURIComponent).join('/')}@${revision}`;
+}
+
+// Whether repoPath is base itself or lies beneath it.
+function repoWithin(base: string, repoPath: string): boolean {
+  return repoPath === base || repoPath.startsWith(base.endsWith('/') ? base : `${base}/`);
+}
+
+const noPathAtRevision = /(?:E|W)160013/;
+
+// The object's own repository path at a revision, found by walking svn's copy
+// history from HEAD. A move or rename changes the path; undefined means the
+// object does not exist at that revision.
+async function pathAt(executable: string, folder: string, location: ObjectLocation, revision: number, signal?: AbortSignal): Promise<string | undefined> {
+  try {
+    const info = parse(await run(executable, folder, ['info', '--xml', '-r', String(revision), '--', `${location.url}@HEAD`], signal));
+    return repoPathOf(location, info.info?.entry?.[0]?.url);
+  } catch (error) {
+    if (error instanceof SvnError && noPathAtRevision.test(error.stderr)) return undefined;
+    throw error;
+  }
+}
+
+export interface RevisionPath {
+  path: string;
+  action: string;
+  kind: string;
+  propertyModified: boolean;
+  copyFrom?: { path: string; revision: number };
+}
+
+// svn log -v lists every path changed in the revision, not only the queried
+// object's. Keep the object's own path at this revision, plus deletions of the
+// path it had before (the source side of a move).
+export async function readRevisionPaths(executable: string, folder: string, location: ObjectLocation, revision: number, signal?: AbortSignal): Promise<RevisionPath[]> {
+  const [current, previous] = await Promise.all([
+    pathAt(executable, folder, location, revision, signal),
+    revision > 1 ? pathAt(executable, folder, location, revision - 1, signal) : undefined
+  ]);
+  const log = parse(await run(executable, folder, ['log', '--xml', '-v', '-r', `${revision}:${revision}`, '--limit', '1', '--', `${location.url}@HEAD`], signal));
+  const entry = toArray(log.log?.logentry)[0];
+  const paths = toArray(entry?.paths?.path).map((item: any): RevisionPath => {
+    const copyPath = item['@_copyfrom-path'];
+    return {
+      path: typeof item['#text'] === 'string' ? item['#text'] : '',
+      action: item['@_action'],
+      kind: item['@_kind'],
+      propertyModified: item['@_prop-mods'] === 'true',
+      copyFrom: typeof copyPath === 'string' ? { path: copyPath, revision: Number(item['@_copyfrom-rev']) } : undefined
+    };
+  });
+  return paths.filter(item => (current !== undefined && repoWithin(current, item.path))
+    || (item.action === 'D' && previous !== undefined && (repoWithin(item.path, previous) || repoWithin(previous, item.path))));
+}
+
+// Before and after come from the revision the change belongs to, never the
+// working copy. A copy's before side is its copy source at the copy revision.
+export async function readRevisionDifference(executable: string, folder: string, location: ObjectLocation, revision: number, change: RevisionPath): Promise<ChangeContent> {
+  const before = change.copyFrom ?? (change.action === 'A' ? undefined : { path: change.path, revision: revision - 1 });
+  const after = change.action === 'D' ? undefined : { path: change.path, revision };
+  const [beforeSide, afterSide] = await Promise.all([before, after].map(side => revisionSide(executable, folder, location, side, change.kind)));
+  return {
+    base: asText(beforeSide.bytes),
+    text: asText(afterSide.bytes),
+    binary: [beforeSide.bytes, afterSide.bytes].some(content => content !== undefined && isBinary(content))
+      || isBinaryMime(beforeSide.properties, afterSide.properties),
+    properties: propertyChanges(beforeSide.properties, afterSide.properties)
+  };
+}
+
+async function revisionSide(executable: string, folder: string, location: ObjectLocation, side: { path: string; revision: number } | undefined, kind: string)
+  : Promise<{ bytes?: Buffer; properties: Map<string, PropertyValue> }> {
+  if (!side) return { properties: new Map() };
+  const [bytes, properties] = await Promise.all([
+    kind === 'dir' ? undefined : catRevision(executable, folder, location.root, side),
+    propertyMap(executable, folder, ['proplist', '--xml', '-v', '--depth', 'empty', '--', repoUrl(location.root, side.path, side.revision)])
+  ]);
+  return { bytes, properties };
+}
+
+async function catRevision(executable: string, folder: string, root: string, side: { path: string; revision: number }): Promise<Buffer | undefined> {
+  try {
+    return await exec(executable, folder, ['cat', '-r', String(side.revision), '--', repoUrl(root, side.path, side.revision)]);
+  } catch (error) {
+    if (error instanceof SvnError && noContentTarget.test(error.stderr)) return undefined;
+    throw error;
+  }
 }
 
 // HEAD is resolved on the server. Copy and move ancestry is followed by svn log
