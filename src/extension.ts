@@ -2,7 +2,8 @@ import * as vscode from 'vscode';
 import * as path from 'node:path';
 import { CommitSelection, WorkingCopyWrites, deletedTreeRoot, pathKey, within } from './commit-selection';
 import {
-  Change, PropertyChange, PropertyValue, addPath, commitFiles, readChanges, readDifference, readWorkingContent, revertChanges, updateScopes, WorkingCopyQueryError
+  Change, HistoryEntry, PropertyChange, PropertyValue, QueryCancelled, addPath, commitFiles, historyBatchSize, readChanges, readDifference,
+  readHistoryBatch, readObjectUrl, readWorkingContent, revertChanges, updateScopes, WorkingCopyQueryError
 } from './svn';
 
 // Local and base content reach the diff editor through this scheme so a deleted
@@ -38,6 +39,25 @@ function propertyText(changes: PropertyChange[], target: string): string {
   }
   if (changes.length === 0) lines.push('（没有属性变化）');
   return lines.join('\n');
+}
+
+interface HistoryItem extends vscode.QuickPickItem {
+  loadMore?: boolean;
+}
+
+// Each failure names its own remedy. None of them may read as an empty history.
+function historyFailure(detail: string): string {
+  if (/E170001|E215004|authentication/i.test(detail)) return '认证失败：请在工作区所在环境的终端完成 SVN 登录后重试。';
+  if (/E230001|certificate/i.test(detail)) return '证书校验失败：请在同一环境的终端确认并信任服务器证书后重试；插件不会忽略证书错误。';
+  if (/E170013|E175002|Unable to connect|Connection refused/i.test(detail)) return '无法连接服务器：请检查网络、代理及仓库地址后重试。';
+  if (/W155010|E155007|E155010|E200009/.test(detail)) return '该对象不在 SVN 版本控制中，没有可查询的历史。';
+  if (/E160013/.test(detail)) return '服务器上找不到该路径，可能尚未提交。';
+  return '请检查 codeSvn.svnPath 设置及查询日志。';
+}
+
+function formatDate(value: string): string {
+  const time = new Date(value);
+  return Number.isNaN(time.getTime()) ? value : time.toLocaleString('zh-CN', { hour12: false });
 }
 
 interface WorkingCopyView {
@@ -468,6 +488,75 @@ export function activate(context: vscode.ExtensionContext): void {
     }
   }
 
+  // Read-only, so it needs no write lock. Closing the picker cancels the query.
+  async function history(resource?: vscode.Uri | vscode.SourceControlResourceState): Promise<void> {
+    const target = !resource ? vscode.window.activeTextEditor?.document.uri
+      : 'resourceUri' in resource ? resource.resourceUri : resource;
+    if (!target || target.scheme !== 'file') {
+      void vscode.window.showWarningMessage('请选择本地文件或目录后查看 SVN 历史。');
+      return;
+    }
+    const scope = target.fsPath;
+    const name = path.basename(scope);
+    const folder = openedFolders().find(candidate => within(candidate.uri.fsPath, scope));
+    if (!folder) {
+      void vscode.window.showErrorMessage(`无法查看 ${name} 的历史：该路径不在当前打开的 SVN 管理范围内。`);
+      return;
+    }
+    const executable = svnExecutable(folder);
+    const controller = new AbortController();
+    const picker = vscode.window.createQuickPick<HistoryItem>();
+    const entries: HistoryEntry[] = [];
+    let url: string | undefined;
+    let hasMore = true;
+    let closed = false;
+    picker.title = `SVN 历史：${name}`;
+    picker.onDidHide(() => { closed = true; controller.abort(); picker.dispose(); });
+    picker.onDidAccept(() => {
+      if (picker.selectedItems[0]?.loadMore && !picker.busy) void load();
+    });
+    const render = () => {
+      picker.items = [
+        ...entries.map((entry): HistoryItem => ({
+          label: `r${entry.revision}`,
+          description: `${entry.author || '（无作者）'} · ${formatDate(entry.date)}`,
+          detail: entry.message.replace(/\s+/g, ' ').trim() || '（无提交信息）'
+        })),
+        ...(hasMore ? [{ label: `$(arrow-down) 加载更早的 ${historyBatchSize} 条`, alwaysShow: true, loadMore: true }] : [])
+      ];
+      picker.placeholder = hasMore ? `已显示 ${entries.length} 条，最新优先` : `已显示全部 ${entries.length} 条，最新优先`;
+    };
+    const load = async (): Promise<void> => {
+      picker.busy = true;
+      try {
+        url ??= await readObjectUrl(executable, folder.uri.fsPath, scope, controller.signal);
+        const last = entries[entries.length - 1];
+        const batch = await readHistoryBatch(executable, folder.uri.fsPath, url, last ? last.revision - 1 : undefined, controller.signal);
+        entries.push(...batch.entries);
+        hasMore = batch.hasMore;
+        if (entries.length === 0) {
+          picker.hide();
+          void vscode.window.showInformationMessage(`${name} 在服务器上没有历史记录。`);
+          return;
+        }
+        render();
+      } catch (error) {
+        if (closed || error instanceof QueryCancelled) return;
+        const detail = error instanceof Error ? error.message : String(error);
+        output.appendLine(`${new Date().toISOString()} 查询历史失败 ${scope}\n${detail}`);
+        // A failed first batch must not look like an empty history. A failed
+        // later batch keeps the loaded records and leaves load-more for retry.
+        if (entries.length === 0) picker.hide();
+        void vscode.window.showErrorMessage(`查询历史失败：${detail} ${historyFailure(detail)}`, '查看日志')
+          .then(action => { if (action === '查看日志') output.show(); });
+      } finally {
+        if (!closed) picker.busy = false;
+      }
+    };
+    picker.show();
+    await load();
+  }
+
   async function refreshOnce(): Promise<void> {
     const folders = openedFolders();
     const folderIds = folders.map(folder => folder.uri.toString());
@@ -592,6 +681,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('codeSvn.update', update),
     vscode.commands.registerCommand('codeSvn.commit', commit),
     vscode.commands.registerCommand('codeSvn.viewChange', (change: Change) => viewChange(change)),
+    vscode.commands.registerCommand('codeSvn.history', (resource?: vscode.Uri | vscode.SourceControlResourceState) => history(resource)),
     vscode.workspace.registerTextDocumentContentProvider(contentScheme, {
       onDidChange: documentChanges.event,
       provideTextDocumentContent: content

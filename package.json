@@ -24,7 +24,8 @@
       { "command": "codeSvn.revert", "title": "SVN：撤销本地变更", "icon": "$(discard)" },
       { "command": "codeSvn.select", "title": "SVN：加入待提交", "icon": "$(add)" },
       { "command": "codeSvn.unselect", "title": "SVN：移出待提交", "icon": "$(remove)" },
-      { "command": "codeSvn.commit", "title": "SVN：提交待提交文件", "icon": "$(check)" }
+      { "command": "codeSvn.commit", "title": "SVN：提交待提交文件", "icon": "$(check)" },
+      { "command": "codeSvn.history", "title": "SVN：查看历史" }
     ],
     "menus": {
       "scm/title": [
@@ -36,7 +37,11 @@
         { "command": "codeSvn.add", "when": "scmProvider == codeSvn && scmResourceGroup == 未跟踪", "group": "inline" },
         { "command": "codeSvn.revert", "when": "scmProvider == codeSvn && scmResourceGroup != 未跟踪", "group": "inline" },
         { "command": "codeSvn.select", "when": "scmProvider == codeSvn && scmResourceGroup != selected && scmResourceGroup != dependencies", "group": "inline" },
-        { "command": "codeSvn.unselect", "when": "scmProvider == codeSvn && scmResourceGroup == selected", "group": "inline" }
+        { "command": "codeSvn.unselect", "when": "scmProvider == codeSvn && scmResourceGroup == selected", "group": "inline" },
+        { "command": "codeSvn.history", "when": "scmProvider == codeSvn", "group": "1_history" }
+      ],
+      "explorer/context": [
+        { "command": "codeSvn.history", "when": "resourceScheme == file", "group": "7_svn" }
       ]
     },
     "configuration": {

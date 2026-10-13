@@ -54,15 +54,20 @@ export class WorkingCopyQueryError extends Error {
   }
 }
 
-function exec(executable: string, cwd: string, args: string[]): Promise<Buffer> {
+export class QueryCancelled extends Error {
+  constructor() { super('历史查询已取消。'); }
+}
+
+function exec(executable: string, cwd: string, args: string[], signal?: AbortSignal): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     // Keep the command first, but never put options after the target terminator.
     const terminator = args.indexOf('--');
     const command = [...args];
     command.splice(terminator === -1 ? command.length : terminator, 0, '--non-interactive');
     execFile(executable, command, {
-      cwd, encoding: 'buffer', windowsHide: true, timeout: 20000, maxBuffer: 32 * 1024 * 1024
+      cwd, encoding: 'buffer', windowsHide: true, timeout: 20000, maxBuffer: 32 * 1024 * 1024, signal
     }, (error, stdout, stderr) => {
+      if (signal?.aborted) return reject(new QueryCancelled());
       // SVN can return exit 0 with warnings and an incomplete/empty status.
       // Such a result cannot establish that the managed scope is clean.
       const detail = stderr.toString('utf8');
@@ -75,13 +80,13 @@ function exec(executable: string, cwd: string, args: string[]): Promise<Buffer> 
   });
 }
 
-function run(executable: string, cwd: string, args: string[]): Promise<string> {
-  return exec(executable, cwd, args).then(stdout => stdout.toString('utf8'));
+function run(executable: string, cwd: string, args: string[], signal?: AbortSignal): Promise<string> {
+  return exec(executable, cwd, args, signal).then(stdout => stdout.toString('utf8'));
 }
 
 const parser = new XMLParser({
   ignoreAttributes: false, parseTagValue: false, parseAttributeValue: false,
-  trimValues: false, isArray: name => ['entry', 'target', 'changelist', 'property'].includes(name)
+  trimValues: false, isArray: name => ['entry', 'target', 'changelist', 'property', 'logentry'].includes(name)
 });
 
 function parse(xml: string) {
@@ -359,6 +364,45 @@ export async function updateScopes(executable: string, root: string, targets: st
       else resolve(stdout.trim());
     });
   });
+}
+
+export interface HistoryEntry {
+  revision: number;
+  author: string;
+  date: string;
+  message: string;
+}
+
+export interface HistoryBatch {
+  entries: HistoryEntry[];
+  hasMore: boolean;
+}
+
+export const historyBatchSize = 50;
+
+// Object URL comes from the working copy's metadata; the history itself is
+// always queried from the server, so an outdated working copy cannot narrow it.
+export async function readObjectUrl(executable: string, folder: string, target: string, signal?: AbortSignal): Promise<string> {
+  const info = parse(await run(executable, folder, ['info', '--xml', '--', `${path.relative(folder, target) || '.'}@`], signal));
+  const url = info.info?.entry?.[0]?.url;
+  if (typeof url !== 'string' || !url) throw new Error('SVN 未返回对象地址，无法查询历史。');
+  return url;
+}
+
+// HEAD is resolved on the server. Copy and move ancestry is followed by svn log
+// by default. Asking for one extra entry tells whether an older batch exists
+// without a second round trip; the next batch starts below the last shown one.
+export async function readHistoryBatch(executable: string, folder: string, url: string, startRevision: number | undefined, signal?: AbortSignal): Promise<HistoryBatch> {
+  const range = startRevision === undefined ? 'HEAD:1' : `${startRevision}:1`;
+  const log = parse(await run(executable, folder, ['log', '--xml', '-r', range, '--limit', String(historyBatchSize + 1), '--', `${url}@HEAD`], signal));
+  const text = (value: unknown) => typeof value === 'string' ? value : '';
+  const entries = toArray(log.log?.logentry).map((entry: any): HistoryEntry => ({
+    revision: Number(entry['@_revision']),
+    author: text(entry.author),
+    date: text(entry.date),
+    message: text(entry.msg)
+  }));
+  return { entries: entries.slice(0, historyBatchSize), hasMore: entries.length > historyBatchSize };
 }
 
 export async function addPath(executable: string, root: string, target: string): Promise<void> {
