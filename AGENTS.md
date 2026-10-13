@@ -2,7 +2,6 @@
 
 ### Issue tracker
 
-使用 HD-yubo 账号管理 daidaini/code-svn-extension 的 GitHub Issues（仓库属主仍是 daidaini，HD-yubo 为 Write 协作者）。
 执行 issue 操作前阅读 docs/agents/issue-tracker.md。
 
 ### Triage labels
