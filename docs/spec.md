@@ -158,5 +158,5 @@ AI 按钮只根据本次提交选择中的变更差异生成中文提交信息�
 - 真实工作副本存在待新增、已修改、未跟踪及属性变更，主要是二进制内容。它适合只读验证，但不能替代隔离仓库中的文本和写操作场景。
 - 中文绝对路径在当前 PowerShell 到 SVN 的调用链中失败，切换工作目录并使用相对目标可成功；路径存在且字符一致，精确原因仍待定位。真实扩展进程需要独立验证。
 - 文件和目录服务器历史已验证可以超过工作副本本地修订号，支持显式查询最新记录的决定。
-- Issue tracker 已配置为 GitHub 仓库 `daidaini/code-svn-extension`，使用 `daidaini` 账号；默认 triage 标签已配置。
+- Issue tracker 已配置为 GitHub 仓库 `daidaini/code-svn-extension`，使用 `HD-yubo` 账号（Write 协作者身份）；默认 triage 标签已配置。
 - 本规格发布时应用 `ready-for-agent`，不需要额外 triage。任务草稿的拆分确认与逐票发布单独进行。

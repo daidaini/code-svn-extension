@@ -1,9 +1,9 @@
 # Issue tracker: GitHub
 
-账号：daidaini
+账号：HD-yubo（daidaini/code-svn-extension 的 Write 协作者）
 仓库：daidaini/code-svn-extension
 
-使用 gh CLI。执行前确认当前登录账号为 daidaini；
+使用 gh CLI。执行前确认当前登录账号为 HD-yubo；
 所有仓库操作显式指定目标仓库，不依赖本地 remote。
 
 规格和任务发布为 GitHub Issues。
