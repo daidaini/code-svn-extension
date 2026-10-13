@@ -328,6 +328,20 @@ export async function readDifference(executable: string, folder: string, change:
   return { ...content, binary: content.binary || binaryMime, properties: changes };
 }
 
+// Shallow explicit targets never traverse untracked files, externals or nested
+// working copies. SVN keeps added files unless --remove-added is requested.
+export async function revertChanges(executable: string, root: string, changes: Change[]): Promise<void> {
+  const ordered = [...changes].sort((a, b) => {
+    const aAdded = a.item === 'added';
+    const bAdded = b.item === 'added';
+    if (aAdded !== bAdded) return aAdded ? 1 : -1;
+    return aAdded ? b.path.length - a.path.length : a.path.length - b.path.length;
+  });
+  for (const change of ordered) {
+    await run(executable, root, ['revert', '--depth', 'empty', '--', `${path.relative(root, change.path) || '.'}@`]);
+  }
+}
+
 export async function addPath(executable: string, root: string, target: string): Promise<void> {
   await run(executable, root, ['add', '--depth', 'empty', '--', `${path.relative(root, target)}@`]);
 }

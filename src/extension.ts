@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import * as path from 'node:path';
 import { CommitSelection, WorkingCopyWrites, deletedTreeRoot, pathKey, within } from './commit-selection';
 import {
-  Change, PropertyChange, PropertyValue, addPath, commitFiles, readChanges, readDifference, readWorkingContent, WorkingCopyQueryError
+  Change, PropertyChange, PropertyValue, addPath, commitFiles, readChanges, readDifference, readWorkingContent, revertChanges, WorkingCopyQueryError
 } from './svn';
 
 // Local and base content reach the diff editor through this scheme so a deleted
@@ -206,6 +206,82 @@ export function activate(context: vscode.ExtensionContext): void {
       const detail = error instanceof Error ? error.message : String(error);
       output.appendLine(`${new Date().toISOString()} 添加失败\n${detail}`);
       void vscode.window.showErrorMessage(`添加失败：${detail} 选择与提交信息已保留。`);
+    } finally { release?.(); }
+  }
+
+  async function revert(resource?: vscode.SourceControlResourceState): Promise<void> {
+    let release: (() => void) | undefined;
+    let changedView: WorkingCopyView | undefined;
+    let attempted: Change[] = [];
+    try {
+      await refresh();
+      const choices = [...views.entries()].flatMap(([key, view]) => view.changes
+        .filter(change => change.item !== 'unversioned' && !deletedTreeRoot(change.path, view.changes))
+        .map(change => ({ label: path.basename(change.path), description: change.path, key, view, change })));
+      const choice = resource?.resourceUri
+        ? choices.find(item => pathKey(item.change.path) === pathKey(resource.resourceUri.fsPath))
+        : await vscode.window.showQuickPick(choices, { placeHolder: '选择要撤销本地变更的文件或目录' });
+      if (!choice) return;
+      release = writes.tryAcquire(choice.key);
+      if (!release) throw new Error('该工作副本正在执行写操作，请等待完成。');
+      const plan = async () => {
+        await refresh();
+        const scopes = openedFolders().map(folder => folder.uri.fsPath);
+        if (views.get(choice.key) !== choice.view || choice.view.lastError
+          || !scopes.some(scope => within(scope, choice.change.path))) {
+          throw new Error('工作副本状态或管理范围已变化，请刷新后重新选择。');
+        }
+        const changes = choice.view.changes.filter(change => within(choice.change.path, change.path) && change.item !== 'unversioned');
+        if (!changes.some(change => pathKey(change.path) === pathKey(choice.change.path))) {
+          throw new Error('变更状态已变化，请刷新后重新选择。');
+        }
+        for (const change of changes) {
+          if (change.conflicted || !['modified', 'normal', 'none', 'added', 'deleted', 'missing', 'replaced'].includes(change.item)) {
+            throw new Error(`${change.path} 的当前状态不支持安全撤销，请先处理冲突或路径阻塞。`);
+          }
+          if ([change.movedFrom, change.movedTo].some(target => target && !changes.some(item => pathKey(item.path) === pathKey(target)))) {
+            throw new Error('撤销范围不包含移动的两端，请选择包含源和目标的目录；不会操作范围外对象。');
+          }
+        }
+        return changes;
+      };
+      const changes = await plan();
+      const dirty = () => vscode.workspace.textDocuments.some(document => document.uri.scheme === 'file'
+        && document.isDirty && within(choice.change.path, document.uri.fsPath));
+      if (dirty()) throw new Error('撤销范围内有未保存内容，请先保存或自行处理；未执行撤销。');
+      const action = await vscode.window.showWarningMessage('撤销将丢弃以下本地修改，无法恢复。', {
+        modal: true,
+        detail: `${choice.change.path}\n目录操作包含下列子项（仅撤销列出的变更）：\n${changes.map(change => `${label(change)}：${change.path}`).join('\n')}\n未跟踪文件不会删除，取消添加保留本地文件。`
+      }, '撤销这些修改');
+      if (action !== '撤销这些修改') return;
+      const current = await plan();
+      if (JSON.stringify(current) !== JSON.stringify(changes)) throw new Error('撤销范围或状态已变化，请重新审阅并确认。');
+      if (dirty()) throw new Error('撤销范围内有未保存内容，请先保存或自行处理；未执行撤销。');
+      const folder = openedFolders().find(folder => within(folder.uri.fsPath, choice.change.path))!;
+      changedView = choice.view;
+      attempted = current;
+      await revertChanges(svnExecutable(folder), choice.view.scm.rootUri!.fsPath, current);
+      await refresh();
+      if (views.get(choice.key) !== choice.view || choice.view.lastError) throw new Error('SVN 撤销已执行，但刷新失败，请核对实际状态，勿盲目重试。');
+      choice.view.selected.complete(current.map(change => change.path));
+      showChanges(choice.view, choice.view.changes);
+      void vscode.window.showInformationMessage(`撤销完成：${current.length} 项变更。取消添加的本地文件已保留。`);
+    } catch (error) {
+      // SVN may have reverted only some targets before failing. Reconcile only
+      // confirmed clean/untracked targets, keeping failed selections and input.
+      if (changedView) {
+        await refresh();
+        if (!changedView.lastError) {
+          changedView.selected.complete(attempted.filter(change => {
+            const current = changedView!.changes.find(item => pathKey(item.path) === pathKey(change.path));
+            return !current || current.item === 'unversioned';
+          }).map(change => change.path));
+          showChanges(changedView, changedView.changes);
+        }
+      }
+      const detail = error instanceof Error ? error.message : String(error);
+      output.appendLine(`${new Date().toISOString()} 撤销失败\n${detail}`);
+      void vscode.window.showErrorMessage(`撤销失败：${detail} 请核对实际状态；提交信息已保留。`);
     } finally { release?.(); }
   }
 
@@ -451,6 +527,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('codeSvn.select', (resource?: vscode.SourceControlResourceState) => chooseChange(false, resource)),
     vscode.commands.registerCommand('codeSvn.unselect', (resource?: vscode.SourceControlResourceState) => chooseChange(true, resource)),
     vscode.commands.registerCommand('codeSvn.add', add),
+    vscode.commands.registerCommand('codeSvn.revert', revert),
     vscode.commands.registerCommand('codeSvn.commit', commit),
     vscode.commands.registerCommand('codeSvn.viewChange', (change: Change) => viewChange(change)),
     vscode.workspace.registerTextDocumentContentProvider(contentScheme, {
