@@ -95,7 +95,7 @@
 
 本机 VS Code CLI 版本为 1.131.0（x64）。WSL CLI 存在，但枚举发行版返回 E_ACCESSDENIED，尚不能确认可用的 WSL 测试环境。
 
-用户已授权使用 `E:\WorkCode\BizDocs` 验证 SVN。该目录为真实工作副本，已完成 info、status、diff、目录/文件 log 及历史差异摘要的只读 CLI 验证；包含中文的绝对路径调用存在待定位问题，相对目录目标查询成功。详细结果及后续验证边界见 [svn-validation.md](./svn-validation.md)，这些结果不等于插件验收通过。
+用户已授权使用 `E:\WorkCode\BizDocs`(`/mnt/e/WorkCode/BizDocs`) 验证 SVN。该目录为真实工作副本，已完成 info、status、diff、目录/文件 log 及历史差异摘要的只读 CLI 验证；包含中文的绝对路径调用存在待定位问题，相对目录目标查询成功。详细结果及后续验证边界见 [svn-validation.md](./svn-validation.md)，这些结果不等于插件验收通过。
 
 ## SVN 行为核对
 
