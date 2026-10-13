@@ -189,7 +189,7 @@ test('选中文件随后产生真实 SVN 冲突时阻止提交，保留选择和
     await ui.command('SVN：提交待提交文件');
     await eventually(async () => assert.match(await ui.notifications(), /存在冲突/));
     assert.equal(revision(f), 2);
-    assert.match(await ui.scmText(), /(?:^|\n)待提交(?:\n|$)/);
+    assert.match(await ui.scmText(), /(?:^|\n)待提交（含冲突）(?:\n|$)/);
     assert.match(await ui.commitMessageText(), /冲突时保留/);
   } finally {
     if (ui) await ui.close();

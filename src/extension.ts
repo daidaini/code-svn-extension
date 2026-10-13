@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import * as path from 'node:path';
 import { CommitSelection, WorkingCopyWrites, deletedTreeRoot, pathKey, within } from './commit-selection';
 import {
-  Change, PropertyChange, PropertyValue, addPath, commitFiles, readChanges, readDifference, readWorkingContent, revertChanges, WorkingCopyQueryError
+  Change, PropertyChange, PropertyValue, addPath, commitFiles, readChanges, readDifference, readWorkingContent, revertChanges, updateScopes, WorkingCopyQueryError
 } from './svn';
 
 // Local and base content reach the diff editor through this scheme so a deleted
@@ -60,12 +60,14 @@ interface WorkingCopyResult {
 function showChanges(view: WorkingCopyView, changes: Change[]): void {
   view.selected.reconcile([...view.ancestors, ...changes]);
   const byLabel = new Map<string, vscode.SourceControlResourceState[]>();
+  const conflictGroups = new Set<string>();
   for (const change of changes) {
     // Children of a scheduled-deletion directory are affected items of that one
     // operation, shown for review even when the directory itself is selected.
     const root = change.item === 'deleted' ? deletedTreeRoot(change.path, changes) : undefined;
     const base = root ? '已删除子项' : label(change);
     const text = view.selected.has(change.path) ? '待提交' : view.selected.isDependency(change.path) ? '必需提交依赖' : base;
+    if (change.conflicted) conflictGroups.add(text);
     const notes: string[] = [];
     if (view.selected.isDependency(change.path)) notes.push('必需提交依赖（随选定子项一起提交）');
     if (root) notes.push(`随整个目录删除（${path.relative(view.scm.rootUri!.fsPath, root.path) || path.basename(root.path)}）一起提交`);
@@ -84,7 +86,10 @@ function showChanges(view: WorkingCopyView, changes: Change[]): void {
     const states = byLabel.get(text) ?? [];
     states.push({
       resourceUri: vscode.Uri.file(change.path),
-      decorations: { tooltip: [base, ...notes].join(' · '), strikeThrough: ['deleted', 'missing'].includes(change.item) },
+      decorations: {
+        tooltip: [base, ...notes].join(' · '), strikeThrough: ['deleted', 'missing'].includes(change.item),
+        iconPath: change.conflicted ? new vscode.ThemeIcon('warning') : undefined
+      },
       command: { command: 'codeSvn.viewChange', title: '查看差异', arguments: [change] }
     });
     byLabel.set(text, states);
@@ -95,7 +100,9 @@ function showChanges(view: WorkingCopyView, changes: Change[]): void {
       group.hideWhenEmpty = true;
       view.groups.set(name, group);
     }
-    view.groups.get(name)!.resourceStates = states;
+    const group = view.groups.get(name)!;
+    group.label = conflictGroups.has(name) && ['待提交', '必需提交依赖'].includes(name) ? `${name}（含冲突）` : name;
+    group.resourceStates = states;
   }
   for (const [name, group] of view.groups) if (!byLabel.has(name)) group.resourceStates = [];
   view.changes = changes;
@@ -282,6 +289,60 @@ export function activate(context: vscode.ExtensionContext): void {
       const detail = error instanceof Error ? error.message : String(error);
       output.appendLine(`${new Date().toISOString()} 撤销失败\n${detail}`);
       void vscode.window.showErrorMessage(`撤销失败：${detail} 请核对实际状态；提交信息已保留。`);
+    } finally { release?.(); }
+  }
+
+  async function update(sourceControl?: vscode.SourceControl): Promise<void> {
+    let release: (() => void) | undefined;
+    try {
+      await refresh();
+      const candidates = [...views.entries()];
+      const candidate = sourceControl ? candidates.find(([, view]) => view.scm === sourceControl)
+        : candidates.length === 1 ? candidates[0]
+          : await vscode.window.showQuickPick(candidates.map(([key, view]) => ({
+            label: view.scm.rootUri!.fsPath, description: '更新该工作副本的打开目录范围', key, view
+          })), { placeHolder: '选择要更新的工作副本（仅更新打开目录）' });
+      if (!candidate) return;
+      const [key, view] = Array.isArray(candidate) ? candidate : [candidate.key, candidate.view];
+      release = writes.tryAcquire(key);
+      if (!release) throw new Error('该工作副本正在执行写操作，请等待完成。');
+      await refresh();
+      if (views.get(key) !== view || view.lastError) throw new Error('无法确认工作副本当前状态，请刷新并检查查询日志。');
+      const folders = [...new Map(openedFolders()
+        .filter(folder => pathKey(knownRoots.get(folder.uri.toString()) ?? '') === key)
+        .map(folder => [pathKey(folder.uri.fsPath), folder])).values()];
+      const scopes = folders.filter(folder => !folders.some(other => other !== folder && within(other.uri.fsPath, folder.uri.fsPath)));
+      if (scopes.length === 0) throw new Error('管理范围已变化，请重新选择。');
+      if (vscode.workspace.textDocuments.some(document => document.uri.scheme === 'file' && document.isDirty
+        && scopes.some(folder => within(folder.uri.fsPath, document.uri.fsPath)))) {
+        throw new Error('更新范围内有未保存内容，请先保存或自行处理；未执行更新。');
+      }
+      try {
+        const result = await updateScopes(svnExecutable(scopes[0]), view.scm.rootUri!.fsPath, scopes.map(folder => folder.uri.fsPath));
+        output.appendLine(`${new Date().toISOString()} 更新 ${view.scm.rootUri!.fsPath}\n${result}`);
+      } finally {
+        // A failed update may already have applied some incoming changes.
+        await refresh();
+        if (views.get(key) === view && !view.lastError) {
+          const currentScopes = openedFolders().filter(folder => pathKey(knownRoots.get(folder.uri.toString()) ?? '') === key);
+          const clean = view.selected.explicitTargets.filter(target => currentScopes.some(folder => within(folder.uri.fsPath, target))
+            && !view.changes.some(change => pathKey(change.path) === pathKey(target)));
+          view.selected.complete(clean);
+          showChanges(view, view.changes);
+        }
+      }
+      if (views.get(key) !== view || view.lastError) throw new Error('SVN 更新已执行，但刷新未能确认完整状态，请核对实际结果，勿盲目重试。');
+      const conflicts = view.changes.filter(change => change.conflicted).length;
+      if (conflicts > 0) {
+        void vscode.window.showWarningMessage(`SVN 更新完成：管理范围内有 ${conflicts} 项冲突。请使用现有工具解决并标记后刷新；不会自动解决冲突或重试提交。`);
+      } else {
+        void vscode.window.showInformationMessage(`SVN 更新完成：已同步 ${scopes.length} 个打开目录范围，未更新未打开区域。`);
+      }
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      output.appendLine(`${new Date().toISOString()} 更新失败\n${detail}`);
+      void vscode.window.showErrorMessage(`更新失败：${detail} 提交信息已保留；请核对实际状态。认证、证书或网络问题请在工作区环境中处理后手动操作。`, '查看日志')
+        .then(action => { if (action === '查看日志') output.show(); });
     } finally { release?.(); }
   }
 
@@ -528,6 +589,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('codeSvn.unselect', (resource?: vscode.SourceControlResourceState) => chooseChange(true, resource)),
     vscode.commands.registerCommand('codeSvn.add', add),
     vscode.commands.registerCommand('codeSvn.revert', revert),
+    vscode.commands.registerCommand('codeSvn.update', update),
     vscode.commands.registerCommand('codeSvn.commit', commit),
     vscode.commands.registerCommand('codeSvn.viewChange', (change: Change) => viewChange(change)),
     vscode.workspace.registerTextDocumentContentProvider(contentScheme, {

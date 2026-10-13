@@ -342,6 +342,25 @@ export async function revertChanges(executable: string, root: string, changes: C
   }
 }
 
+// Update only explicit managed scopes. Do not traverse externals, expand sparse
+// checkout depth, resolve conflicts, or kill a partially applied update on a timer.
+export async function updateScopes(executable: string, root: string, targets: string[]): Promise<string> {
+  if (targets.length === 0) throw new Error('没有可更新的管理范围。');
+  return new Promise((resolve, reject) => {
+    const child = spawn(executable, ['update', '--non-interactive', '--ignore-externals', '--accept', 'postpone', '--',
+      ...targets.map(target => `${path.relative(root, target) || '.'}@`)], { cwd: root, windowsHide: true });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', chunk => { stdout += chunk.toString('utf8'); });
+    child.stderr.on('data', chunk => { stderr += chunk.toString('utf8'); });
+    child.on('error', error => reject(new Error(`SVN 更新失败：${error.message}`)));
+    child.on('close', code => {
+      if (code !== 0 || stderr.trim()) reject(new Error(`SVN 更新失败：${stderr.trim() || `退出码 ${code}`}\n${stdout.trim()}`));
+      else resolve(stdout.trim());
+    });
+  });
+}
+
 export async function addPath(executable: string, root: string, target: string): Promise<void> {
   await run(executable, root, ['add', '--depth', 'empty', '--', `${path.relative(root, target)}@`]);
 }

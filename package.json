@@ -18,6 +18,7 @@
   "contributes": {
     "commands": [
       { "command": "codeSvn.refresh", "title": "SVN：刷新变更", "icon": "$(refresh)" },
+      { "command": "codeSvn.update", "title": "SVN：更新管理范围", "icon": "$(sync)" },
       { "command": "codeSvn.showOutput", "title": "SVN：查看查询日志" },
       { "command": "codeSvn.add", "title": "SVN：添加到版本控制", "icon": "$(plus)" },
       { "command": "codeSvn.revert", "title": "SVN：撤销本地变更", "icon": "$(discard)" },
@@ -28,6 +29,7 @@
     "menus": {
       "scm/title": [
         { "command": "codeSvn.refresh", "when": "scmProvider == codeSvn", "group": "navigation" },
+        { "command": "codeSvn.update", "when": "scmProvider == codeSvn", "group": "navigation" },
         { "command": "codeSvn.commit", "when": "scmProvider == codeSvn", "group": "navigation" }
       ],
       "scm/resourceState/context": [
