@@ -80,6 +80,10 @@ async function host(root, folder, settings = {}) {
     });
     return {
       page,
+      // A notification button (for example the "Use weaker encryption" notice shown when no
+      // keyring is available) steals focus and swallows F1 and sidebar shortcuts, so return
+      // focus to the workbench before sending a keybinding.
+      focus: () => page.evaluate(() => document.querySelector('.monaco-workbench')?.focus()),
       folders: setFolders,
       async settings(values) {
         const file = path.join(profile, 'User', 'settings.json');
@@ -87,8 +91,11 @@ async function host(root, folder, settings = {}) {
         await fs.writeFile(file, JSON.stringify({ ...current, ...values }));
       },
       async command(title, waitForClose = true) {
+        await this.focus();
         await page.keyboard.press('F1');
-        const input = page.locator('.quick-input-widget input').first();
+        // Closed input boxes stay in the DOM; only the visible one is the palette or prompt.
+        const input = page.locator('.quick-input-widget input:visible').first();
+        await input.waitFor();
         await input.fill(`>${title}`);
         await page.locator('.quick-input-list .monaco-list-row').filter({ hasText: title }).first().waitFor();
         await page.keyboard.press('Enter');
@@ -97,9 +104,10 @@ async function host(root, folder, settings = {}) {
       async chooseChange(title, name) {
         await this.command(title, false);
         await page.locator('.quick-input-list .monaco-list-row').filter({ hasText: name }).first().click();
-        await page.locator('.quick-input-widget input').first().waitFor({ state: 'hidden' });
+        await page.locator('.quick-input-widget input:visible').first().waitFor({ state: 'hidden' });
       },
       async commitMessage(message, index = 0) {
+        await this.focus();
         await page.keyboard.press('Control+Shift+G');
         const input = page.locator('.scm-view .scm-input .monaco-editor').nth(index);
         await input.click({ position: { x: 30, y: 15 } });
@@ -110,8 +118,9 @@ async function host(root, folder, settings = {}) {
         return (await page.locator('.scm-view .scm-input').nth(index).locator('.view-lines').allInnerTexts()).join('\n').replace(/\u00a0/g, ' ');
       },
       async editFile(target, text) {
+        await this.focus();
         await page.keyboard.press('Control+P');
-        const input = page.locator('.quick-input-widget input').first();
+        const input = page.locator('.quick-input-widget input:visible').first();
         await input.fill(target);
         await page.locator('.quick-input-list .monaco-list-row').filter({ hasText: path.basename(target) }).first().waitFor();
         await page.keyboard.press('Enter');

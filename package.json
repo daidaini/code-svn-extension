@@ -25,13 +25,16 @@
       { "command": "codeSvn.select", "title": "SVN：加入待提交", "icon": "$(add)" },
       { "command": "codeSvn.unselect", "title": "SVN：移出待提交", "icon": "$(remove)" },
       { "command": "codeSvn.commit", "title": "SVN：提交待提交文件", "icon": "$(check)" },
+      { "command": "codeSvn.generateDraft", "title": "SVN：生成提交信息草稿", "icon": "$(sparkle)" },
+      { "command": "codeSvn.setApiKey", "title": "SVN：配置 AI API Key" },
       { "command": "codeSvn.history", "title": "SVN：查看历史" }
     ],
     "menus": {
       "scm/title": [
         { "command": "codeSvn.refresh", "when": "scmProvider == codeSvn", "group": "navigation" },
         { "command": "codeSvn.update", "when": "scmProvider == codeSvn", "group": "navigation" },
-        { "command": "codeSvn.commit", "when": "scmProvider == codeSvn", "group": "navigation" }
+        { "command": "codeSvn.commit", "when": "scmProvider == codeSvn", "group": "navigation" },
+        { "command": "codeSvn.generateDraft", "when": "scmProvider == codeSvn", "group": "navigation" }
       ],
       "scm/resourceState/context": [
         { "command": "codeSvn.add", "when": "scmProvider == codeSvn && scmResourceGroup == 未跟踪", "group": "inline" },
@@ -50,6 +53,18 @@
         "codeSvn.svnPath": {
           "type": "string", "default": "svn", "scope": "machine-overridable",
           "description": "工作区所在环境的 SVN 可执行文件路径。Windows 与 WSL 分别安装和配置 SVN。"
+        },
+        "codeSvn.ai.baseUrl": {
+          "type": "string", "default": "", "scope": "window",
+          "description": "OpenAI 兼容模型服务的 API Base URL，例如 https://api.openai.com/v1。留空时不发送生成请求。"
+        },
+        "codeSvn.ai.model": {
+          "type": "string", "default": "", "scope": "window",
+          "description": "生成提交信息草稿使用的模型名称。首版仅支持一套有效配置。"
+        },
+        "codeSvn.ai.timeoutSeconds": {
+          "type": "number", "default": 60, "minimum": 1, "maximum": 600, "scope": "window",
+          "description": "生成请求的超时秒数。超时后保留原提交信息，由用户手动重试。"
         }
       }
     }

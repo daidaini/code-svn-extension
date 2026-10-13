@@ -2,7 +2,10 @@ import * as vscode from 'vscode';
 import * as path from 'node:path';
 import { CommitSelection, WorkingCopyWrites, deletedTreeRoot, pathKey, within } from './commit-selection';
 import {
-  Change, HistoryEntry, ObjectLocation, PropertyChange, PropertyValue, QueryCancelled, RevisionPath, addPath, commitFiles, historyBatchSize,
+  AiCancelled, DraftInput, AiSettings, apiKeySecret, collectDraftInput, configurationProblems, requestDraft
+} from './ai';
+import {
+  Change, changeLabel as label, HistoryEntry, ObjectLocation, PropertyChange, PropertyValue, QueryCancelled, RevisionPath, addPath, commitFiles, historyBatchSize,
   readChanges, readDifference, readHistoryBatch, readObjectLocation, readRevisionDifference, readRevisionPaths, readWorkingContent,
   revertChanges, updateScopes, WorkingCopyQueryError
 } from './svn';
@@ -12,20 +15,6 @@ import {
 const contentScheme = 'codeSvn';
 // Historical sides are read-only documents keyed by revision, outside any working copy.
 const revisionScheme = 'codeSvnRevision';
-
-const labels: Record<string, string> = {
-  modified: '已修改', added: '已添加', deleted: '已删除', missing: '本地缺失',
-  unversioned: '未跟踪', replaced: '已替换', obstructed: '路径阻塞', incomplete: '不完整'
-};
-
-function label(change: Change): string {
-  if (change.conflicted) return '冲突';
-  if (['normal', 'none'].includes(change.item)) return '属性已修改';
-  if (change.item === 'deleted' && change.kind === 'dir') return '已删除（整个目录）';
-  if (change.item === 'added' && change.copied) return change.movedFrom ? '已移动' : '已复制';
-  const text = labels[change.item] ?? `SVN 状态：${change.item}`;
-  return change.props === 'modified' ? `${text}（含属性）` : text;
-}
 
 function sideUri(target: string, side: 'base' | 'working' | 'properties'): vscode.Uri {
   return vscode.Uri.file(target).with({ scheme: contentScheme, query: side });
@@ -152,6 +141,7 @@ export function activate(context: vscode.ExtensionContext): void {
   const documents = new Map<string, string>();
   const documentChanges = new vscode.EventEmitter<vscode.Uri>();
   const writes = new WorkingCopyWrites();
+  const drafts = new Map<string, AbortController>();
   let knownRoots = new Map<string, string>();
   let disposed = false;
   let pending = false;
@@ -164,6 +154,16 @@ export function activate(context: vscode.ExtensionContext): void {
 
   function svnExecutable(folder: vscode.WorkspaceFolder): string {
     return vscode.workspace.getConfiguration('codeSvn', folder.uri).get<string>('svnPath', 'svn');
+  }
+
+  function aiSettings(scopePath: string): AiSettings {
+    const folder = openedFolders().find(candidate => within(candidate.uri.fsPath, scopePath));
+    const config = vscode.workspace.getConfiguration('codeSvn', folder?.uri ?? null);
+    return {
+      baseUrl: config.get<string>('ai.baseUrl', ''),
+      model: config.get<string>('ai.model', ''),
+      timeoutSeconds: config.get<number>('ai.timeoutSeconds', 60)
+    };
   }
 
   async function chooseChange(remove: boolean, resource?: vscode.SourceControlResourceState): Promise<void> {
@@ -431,6 +431,137 @@ export function activate(context: vscode.ExtensionContext): void {
       void vscode.window.showErrorMessage(`${detail} 选择与提交信息已保留。${guidance}`, '查看日志')
         .then(action => { if (action === '查看日志') output.show(); });
     } finally { release(); }
+  }
+
+  async function configureApiKey(): Promise<void> {
+    const saved = await context.secrets.get(apiKeySecret);
+    const value = await vscode.window.showInputBox({
+      title: '配置模型服务的 API Key',
+      prompt: '密钥保存在 VS Code SecretStorage，不写入设置文件或日志。留空并回车可清除已保存的密钥。',
+      password: true, ignoreFocusOut: true,
+      placeHolder: saved ? '已保存密钥；输入新值替换，留空则清除' : '输入 API Key'
+    });
+    if (value === undefined) return;
+    if (!value.trim()) {
+      await context.secrets.delete(apiKeySecret);
+      void vscode.window.showInformationMessage('已清除保存的 API Key。');
+      return;
+    }
+    await context.secrets.store(apiKeySecret, value.trim());
+    void vscode.window.showInformationMessage('API Key 已保存到 VS Code SecretStorage。');
+  }
+
+  // Generation and commit share one commit selection. Only plain text content differences
+  // go out in this step; every other input is refused before the request is sent.
+  async function generate(sourceControl?: vscode.SourceControl): Promise<void> {
+    const candidates = [...views.entries()];
+    const candidate = sourceControl ? candidates.find(([, view]) => view.scm === sourceControl)
+      : candidates.length === 1 ? candidates[0]
+        : (await vscode.window.showQuickPick(candidates.map(([key, view]) => ({
+          label: view.scm.rootUri!.fsPath, description: `${view.selected.size} 项待提交`, key, view
+        })), { placeHolder: '选择要为哪个工作副本生成提交信息草稿' }));
+    if (!candidate) return;
+    const [key, view] = Array.isArray(candidate) ? candidate : [candidate.key, candidate.view];
+    if (drafts.has(key)) {
+      void vscode.window.showWarningMessage('该工作副本正在生成提交信息草稿，请等待完成或取消；不会重复请求。');
+      return;
+    }
+    const targets = view.selected.targets;
+    if (targets.length === 0) {
+      void vscode.window.showWarningMessage('没有待提交文件，请先加入待提交；生成与提交使用同一份提交选择。');
+      return;
+    }
+    const settings = aiSettings(targets[0]);
+    const apiKey = (await context.secrets.get(apiKeySecret))?.trim() ?? '';
+    const problems = configurationProblems(settings, apiKey);
+    if (problems.length > 0) {
+      void vscode.window.showErrorMessage(`AI 配置不完整：${problems.join('；')}；未发送请求。`, '配置 AI 服务', '设置 API Key')
+        .then(action => {
+          if (action === '配置 AI 服务') void vscode.commands.executeCommand('workbench.action.openSettings', 'codeSvn.ai');
+          if (action === '设置 API Key') void vscode.commands.executeCommand('codeSvn.setApiKey');
+        });
+      return;
+    }
+    const scopes = openedFolders().map(folder => folder.uri.fsPath);
+    const folder = openedFolders().find(choice => within(choice.uri.fsPath, targets[0]));
+    if (!folder) { void vscode.window.showWarningMessage('管理范围已变化，请刷新后重新选择待提交文件。'); return; }
+    const executable = svnExecutable(folder);
+    const root = view.scm.rootUri!.fsPath;
+    const changed = () => [...view.ancestors, ...view.changes];
+    const validate = async (current: string[]): Promise<void> => {
+      await refresh();
+      if (views.get(key) !== view || view.lastError) throw new Error('无法确认工作副本当前状态，请刷新并检查查询日志。');
+      await view.selected.validate(current, changed(), scopes);
+    };
+    const collect = (): Promise<DraftInput> => collectDraftInput(executable, scopes, root, changed(), targets);
+    const controller = new AbortController();
+    drafts.set(key, controller);
+    try {
+      await validate(targets);
+      const dirty = () => vscode.workspace.textDocuments.filter(document => document.uri.scheme === 'file'
+        && document.isDirty && targets.some(target => pathKey(target) === pathKey(document.uri.fsPath)));
+      if (dirty().length > 0) {
+        const action = await vscode.window.showWarningMessage('选中文件有未保存内容。保存后再生成草稿？', { modal: true }, '保存并生成');
+        if (action !== '保存并生成') return;
+        for (const document of dirty()) if (!await document.save()) throw new Error(`无法保存 ${document.uri.fsPath}，生成已停止。`);
+        await validate(targets);
+        if (dirty().length > 0) throw new Error('选中文件仍有未保存内容，生成已停止。');
+      }
+      const collected = await collect();
+      if (collected.unsupported.length > 0) {
+        throw new Error(`本次待提交包含尚不支持的输入：${collected.unsupported.join('；')}。当前只支持普通文本内容修改；属性、新增、删除、目录、冲突与二进制输入尚未支持，未发送请求。`);
+      }
+      const original = view.scm.inputBox.value;
+      if (original.trim()) {
+        const action = await vscode.window.showWarningMessage('生成结果将替换当前提交信息，是否继续？',
+          { modal: true, detail: `${original.slice(0, 400)}${original.length > 400 ? '…' : ''}` }, '继续生成');
+        if (action !== '继续生成') return;
+      }
+      const draft = await vscode.window.withProgress({
+        location: vscode.ProgressLocation.Notification, title: '正在生成提交信息草稿…', cancellable: true
+      }, (_progress, token) => {
+        token.onCancellationRequested(() => controller.abort());
+        return requestDraft(settings, apiKey, collected.items, controller.signal);
+      });
+      // Any selection or content change during the request shows up in the re-collected
+      // differences, so a mismatch discards the result instead of filling a stale draft.
+      const current = view.selected.targets;
+      const sameSelection = current.length === targets.length
+        && targets.every(target => current.some(item => pathKey(item) === pathKey(target)));
+      await refresh();
+      if (views.get(key) !== view || view.lastError) {
+        void vscode.window.showErrorMessage('生成完成但无法确认工作副本当前状态，草稿未填入；请刷新后重试。');
+        return;
+      }
+      let verified: DraftInput | undefined;
+      if (sameSelection) {
+        try {
+          await validate(current);
+          verified = await collectDraftInput(executable, scopes, root, changed(), current);
+        } catch { verified = undefined; }
+      }
+      if (!verified || verified.unsupported.length > 0 || JSON.stringify(verified.items) !== JSON.stringify(collected.items)) {
+        void vscode.window.showInformationMessage('提交选择或相关内容在生成期间已变化，草稿未填入；请重新生成。');
+        return;
+      }
+      if (view.scm.inputBox.value !== original) {
+        void vscode.window.showInformationMessage('提交信息在生成期间已被修改，草稿未填入；需要时请重新生成。');
+        return;
+      }
+      view.scm.inputBox.value = draft;
+      void vscode.window.showInformationMessage('草稿已填入提交信息输入框，请审阅或修改后手动提交；插件不会自动提交。');
+    } catch (error) {
+      if (error instanceof AiCancelled) {
+        void vscode.window.showInformationMessage('生成已取消；原提交信息保持不变。');
+        return;
+      }
+      const detail = error instanceof Error ? error.message : String(error);
+      output.appendLine(`${new Date().toISOString()} 生成提交信息草稿失败\n${detail}`);
+      void vscode.window.showErrorMessage(`${detail} 原提交信息保持不变，需要时请手动重试。`, '查看日志')
+        .then(action => { if (action === '查看日志') output.show(); });
+    } finally {
+      drafts.delete(key);
+    }
   }
 
   async function viewChange(change: Change): Promise<void> {
@@ -778,6 +909,8 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('codeSvn.revert', revert),
     vscode.commands.registerCommand('codeSvn.update', update),
     vscode.commands.registerCommand('codeSvn.commit', commit),
+    vscode.commands.registerCommand('codeSvn.generateDraft', (sourceControl?: vscode.SourceControl) => generate(sourceControl)),
+    vscode.commands.registerCommand('codeSvn.setApiKey', configureApiKey),
     vscode.commands.registerCommand('codeSvn.viewChange', (change: Change) => viewChange(change)),
     vscode.commands.registerCommand('codeSvn.history', (resource?: vscode.Uri | vscode.SourceControlResourceState) => history(resource)),
     vscode.workspace.registerTextDocumentContentProvider(contentScheme, {

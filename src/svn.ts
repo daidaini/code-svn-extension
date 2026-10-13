@@ -44,6 +44,22 @@ export interface ChangeContent extends WorkingContent {
   properties: PropertyChange[];
 }
 
+const statusLabels: Record<string, string> = {
+  modified: '已修改', added: '已添加', deleted: '已删除', missing: '本地缺失',
+  unversioned: '未跟踪', replaced: '已替换', obstructed: '路径阻塞', incomplete: '不完整'
+};
+
+// One readable name per SVN status; the commit view and the AI input boundary
+// must describe a change the same way.
+export function changeLabel(change: Change): string {
+  if (change.conflicted) return '冲突';
+  if (['normal', 'none'].includes(change.item)) return '属性已修改';
+  if (change.item === 'deleted' && change.kind === 'dir') return '已删除（整个目录）';
+  if (change.item === 'added' && change.copied) return change.movedFrom ? '已移动' : '已复制';
+  const text = statusLabels[change.item] ?? `SVN 状态：${change.item}`;
+  return change.props === 'modified' ? `${text}（含属性）` : text;
+}
+
 class SvnError extends Error {
   constructor(message: string, readonly stderr: string) { super(message); }
 }
