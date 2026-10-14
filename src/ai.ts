@@ -1,11 +1,12 @@
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { pathKey, within } from './commit-selection';
-import { Change, ChangeContent, changeLabel, readDifference } from './svn';
+import { Change, ChangeContent, changeLabel, PropertyChange, PropertyValue, readDifference } from './svn';
 
-// This step covers plain text content changes only. Property, added, deleted,
-// directory, conflicted, symlink and binary inputs arrive in later steps: anything
-// not covered is refused explicitly instead of sending a partial selection.
+// Every selected change is described: text differences, property changes, added,
+// deleted and directory items. Binary content is never sent, only its path and type.
+// Conflicted, symlink and other special states are refused explicitly instead of
+// sending a partial selection.
 
 export interface AiSettings {
   baseUrl: string;
@@ -14,12 +15,14 @@ export interface AiSettings {
 }
 
 export interface DraftItem {
-  display: string;
-  diff: string;
+  heading: string;
+  body: string;
 }
 
 export interface DraftInput {
   items: DraftItem[];
+  // Paths whose binary content was left out; the user must be told about them.
+  binary: string[];
   unsupported: string[];
 }
 
@@ -49,25 +52,72 @@ export function configurationProblems(settings: AiSettings, apiKey: string | und
   return problems;
 }
 
-// Read each selected target's difference. Anything outside this step's scope joins
-// `unsupported`, and the caller refuses the whole request instead of a partial one.
+// Change states that can be described. Conflicts, symbolic links and anything else
+// are refused as a whole, because a partial description would misstate the commit.
+const describedStates = ['modified', 'normal', 'added', 'deleted'];
+
+function kindLabel(kind: 'file' | 'dir' | undefined): string {
+  return kind === 'dir' ? '目录' : kind === 'file' ? '文件' : '路径';
+}
+
+function displayPath(root: string, target: string): string {
+  return path.relative(root, target).split(path.sep).join('/') || path.basename(target);
+}
+
+// Where a move or copy came from or went to, so the model reads both sides together.
+function changeNote(root: string, change: Change): string {
+  if (change.movedTo) return `（移动到 ${displayPath(root, change.movedTo)}）`;
+  if (change.movedFrom) return `（移动自 ${displayPath(root, change.movedFrom)}）`;
+  if (change.copiedFrom) return `（复制自 ${change.copiedFrom.repoPath}@r${change.copiedFrom.rev}）`;
+  return '';
+}
+
+function propertyValueText(value: PropertyValue): string {
+  if (value.encoding === 'text') return value.value;
+  const bytes = Buffer.from(value.value, 'base64');
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  } catch {
+    return `（非 UTF-8 的属性值，${bytes.length} 字节）`;
+  }
+}
+
+function describeProperty(change: PropertyChange): string {
+  const { before, after } = change;
+  if (before && after) return `${change.name}：由 ${JSON.stringify(propertyValueText(before))} 改为 ${JSON.stringify(propertyValueText(after))}`;
+  if (after) return `${change.name}：新增为 ${JSON.stringify(propertyValueText(after))}`;
+  if (before) return `${change.name}：已删除（原为 ${JSON.stringify(propertyValueText(before))}）`;
+  return change.name;
+}
+
+// Read each selected target's difference. Required parent directories and move sources
+// are targets too, so they are described rather than left out. Anything outside the
+// described states joins `unsupported`, and the caller refuses the whole request.
 export async function collectDraftInput(
   executable: string, folders: string[], root: string, changes: Change[], targets: string[]
 ): Promise<DraftInput> {
   const items: DraftItem[] = [];
+  const binary: string[] = [];
   const unsupported: string[] = [];
   for (const target of targets) {
-    const display = path.relative(root, target).split(path.sep).join('/') || path.basename(target);
+    const display = displayPath(root, target);
     const change = changes.find(candidate => pathKey(candidate.path) === pathKey(target));
     const folder = folders.find(candidate => within(candidate, target));
     if (!change || !folder) { unsupported.push(`${display}：状态或管理范围已变化`); continue; }
     if (change.conflicted) { unsupported.push(`${display}：存在冲突`); continue; }
-    if (change.props === 'modified') { unsupported.push(`${display}：属性变化`); continue; }
-    if (change.item !== 'modified') { unsupported.push(`${display}：${changeLabel(change)}`); continue; }
+    if (!describedStates.includes(change.item)) { unsupported.push(`${display}：${changeLabel(change)}`); continue; }
+    const label = `${changeLabel(change)}${changeNote(root, change)}`;
+    if (change.item === 'deleted') {
+      // A deleted item has no local content to read; its type and removal are the whole description.
+      items.push({ heading: `${kindLabel(change.kind)}：${display}`, body: `变更类型：${label}` });
+      continue;
+    }
     const stat = await fs.lstat(target).catch(() => undefined);
     if (!stat) { unsupported.push(`${display}：本地文件不可读取`); continue; }
     if (stat.isSymbolicLink()) { unsupported.push(`${display}：符号链接`); continue; }
-    if (!stat.isFile()) { unsupported.push(`${display}：不是普通文件`); continue; }
+    if (!stat.isFile() && !stat.isDirectory()) { unsupported.push(`${display}：不是普通文件或目录`); continue; }
+    const isDirectory = stat.isDirectory();
+    const heading = `${kindLabel(isDirectory ? 'dir' : 'file')}：${display}`;
     let content: ChangeContent;
     try {
       content = await readDifference(executable, folder, change);
@@ -75,16 +125,42 @@ export async function collectDraftInput(
       unsupported.push(`${display}：读取差异失败（${error instanceof Error ? error.message : String(error)}）`);
       continue;
     }
-    if (content.binary) { unsupported.push(`${display}：二进制内容`); continue; }
-    if (content.properties.length > 0) { unsupported.push(`${display}：属性变化`); continue; }
-    if (content.base === undefined || content.text === undefined) {
-      unsupported.push(`${display}：没有可比对的文本内容`); continue;
+    if (!isDirectory && content.binary) {
+      // Binary content is never sent; the path and change type are all the model gets.
+      binary.push(display);
+      items.push({ heading, body: `变更类型：${label}（二进制内容，未提供内容）` });
+      continue;
     }
-    const diff = textDiff(display, content.base, content.text);
-    if (!diff) { unsupported.push(`${display}：没有文本内容差异`); continue; }
-    items.push({ display, diff });
+    const properties = content.properties.map(describeProperty);
+    let diff = '';
+    if (!isDirectory) {
+      // An added file compares against nothing; a copy compares against its copy source.
+      const before = content.base ?? (change.item === 'added' ? '' : undefined);
+      if (content.text === undefined || before === undefined) { unsupported.push(`${display}：没有可比对的文本内容`); continue; }
+      diff = textDiff(display, before, content.text);
+    }
+    if (change.item === 'modified' && !diff && properties.length === 0) {
+      unsupported.push(`${display}：没有文本内容差异`);
+      continue;
+    }
+    const parts = [`变更类型：${label}`];
+    if (properties.length > 0) parts.push('属性变化：', ...properties.map(line => `- ${line}`));
+    if (diff) parts.push('文本差异：', diff);
+    items.push({ heading, body: parts.join('\n') });
   }
-  return { items, unsupported };
+  return { items, binary, unsupported };
+}
+
+// Hard cap on one request. Oversized input is refused whole: never truncated, never
+// split into several requests, since a partial summary would misstate the commit.
+const maxInputCharacters = 60_000;
+
+export function assertInputWithinLimit(items: DraftItem[]): void {
+  const messages = buildMessages(items);
+  const characters = messages.system.length + messages.user.length;
+  if (characters > maxInputCharacters) {
+    throw new Error(`本次待提交的变更内容约 ${characters} 字符，超过上限 ${maxInputCharacters} 字符，未发送请求。请缩小待提交选择后重新生成。`);
+  }
 }
 
 function lines(text: string): string[] {
@@ -178,11 +254,11 @@ export function textDiff(display: string, before: string, after: string): string
 }
 
 export function buildMessages(items: DraftItem[]): { system: string; user: string } {
-  const system = '你是版本管理助手。根据用户提供的一次 SVN 提交的文本差异，用中文撰写提交信息草稿：'
+  const system = '你是版本管理助手。根据用户提供的一次 SVN 提交的变更说明（含文本差异与属性变化），用中文撰写提交信息草稿：'
     + '第一行为不超过 50 字的简短标题；确有必要时另起数行，每行以「- 」开头列出变更要点。'
     + '只输出提交信息本身，不要解释，不要 Markdown 代码块，也不要 Conventional Commits 前缀。';
-  const blocks = items.map(item => `### 文件：${item.display}\n${item.diff}`);
-  const user = `本次提交选择共 ${items.length} 个文本文件的变更，逐项列出相对工作副本根的路径及其统一差异：\n\n${blocks.join('\n\n')}`;
+  const blocks = items.map(item => `### ${item.heading}\n${item.body}`);
+  const user = `本次提交选择共 ${items.length} 项变更，逐项列出相对工作副本根的路径、变更类型，以及属性变化与文本差异。二进制文件只列出路径与变更类型，其内容未提供，不得推测。\n\n${blocks.join('\n\n')}`;
   return { system, user };
 }
 

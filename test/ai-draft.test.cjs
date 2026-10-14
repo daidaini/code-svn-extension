@@ -52,6 +52,12 @@ function fail(response, status, body) {
   response.end(body);
 }
 
+// The part of the request under one item heading, so assertions cannot match a later item.
+function section(input, heading) {
+  const start = input.indexOf(`### ${heading}`);
+  return start < 0 ? '' : input.slice(start).split('\n### ')[0];
+}
+
 function revision(f) {
   return Number(/revision="(\d+)"/.exec(svn(f.root, 'info', '--xml', f.url))[1]);
 }
@@ -261,47 +267,103 @@ test('提交输入框已有内容时先确认；取消不请求也不覆盖，�
   }
 });
 
-test('属性、二进制与新增输入明确拒绝且不发送请求，普通文本修改仍可生成', { timeout: 180000 }, async () => {
+test('新增文件连同提交依赖父目录与属性进入请求；未跟踪与未选兄弟不进入', { timeout: 240000 }, async () => {
   const f = await fixture();
-  const svc = await service((response, _request, schedule) => delayed(response, schedule, '不该被调用的草稿', 0));
+  const svc = await service((response, _request, schedule) => delayed(response, schedule, '新增文件与属性的草稿', 0));
   let ui;
   try {
     svn(f.scope, 'propset', 'owner', 'team', '修改 中文.txt');
-    await fs.writeFile(path.join(f.scope, 'data.bin'), Buffer.from([1, 2, 3, 4]));
-    svn(f.scope, 'add', 'data.bin');
-    svn(f.scope, 'commit', 'data.bin', '-m', '二进制基线');
-    await fs.writeFile(path.join(f.scope, 'data.bin'), Buffer.from([9, 8, 7, 6, 0]));
-    await fs.writeFile(path.join(f.scope, '新增.txt'), 'NEW\n');
-    svn(f.scope, 'add', '新增.txt');
+    await fs.mkdir(path.join(f.scope, '新建目录'));
+    svn(f.scope, 'add', '--depth', 'empty', '新建目录');
+    svn(f.scope, 'propset', 'note', 'x', '新建目录');
+    await fs.writeFile(path.join(f.scope, '新建目录', '新文件.txt'), 'NEW-ADDED-LINE\n');
+    svn(f.scope, 'add', '新建目录/新文件.txt');
+    await fs.writeFile(path.join(f.scope, '新建目录', '未选.txt'), 'UNSELECTED-SIBLING\n');
+    await fs.writeFile(path.join(f.scope, '未跟踪.txt'), 'UNTRACKED-CONTENT\n');
     ui = await host(f.root, f.scope, { 'codeSvn.ai.baseUrl': svc.url, 'codeSvn.ai.model': 'test-model' });
     await ui.command('SVN：刷新变更');
+    await ui.chooseChange('SVN：加入待提交', '修改 中文.txt');
+    await ui.chooseChange('SVN：加入待提交', '新文件.txt');
     await setApiKey(ui);
-    for (const name of ['修改 中文.txt', 'data.bin', '新增.txt']) {
-      await ui.chooseChange('SVN：加入待提交', name);
-    }
-    await generateDraft(ui);
-    await eventually(async () => assert.match(await ui.notifications(), /尚不支持的输入/), 15000);
-    const message = await ui.notifications();
-    assert.match(message, /修改 中文\.txt：属性变化/);
-    assert.match(message, /data\.bin：二进制内容/);
-    assert.match(message, /新增\.txt：已添加/);
-    assert.match(message, /未发送请求/);
-    assert.equal(svc.requests.length, 0);
 
-    // Commit the added file, then make it a plain text change: refusal only covered that input.
-    await clearToasts(ui);
-    svn(f.scope, 'commit', '新增.txt', '-m', '新增基线');
-    await fs.writeFile(path.join(f.scope, '新增.txt'), '现在的文本内容\n');
-    for (const name of ['修改 中文.txt', 'data.bin', '新增.txt']) {
-      await ui.chooseChange('SVN：移出待提交', name);
-    }
-    await eventually(async () => assert.match(await ui.scmText(), /新增\.txt/));
-    await ui.chooseChange('SVN：加入待提交', '新增.txt');
     await generateDraft(ui);
     await eventually(async () => assert.match(await ui.notifications(), /草稿已填入/));
     assert.equal(svc.requests.length, 1);
-    assert.match(svc.requests[0].body, /### 文件：中文 空格 @目录\/新增\.txt/);
-    assert.match(svc.requests[0].body, /\+现在的文本内容/);
+    const input = JSON.parse(svc.requests[0].body).messages[1].content;
+    assert.match(section(input, '文件：中文 空格 @目录/修改 中文.txt'), /owner：新增为 "team"/, '文件属性必须进入请求');
+    assert.match(section(input, '目录：中文 空格 @目录/新建目录'), /变更类型：已添加[\s\S]*note：新增为 "x"/, '提交依赖父目录及其属性必须进入请求');
+    assert.match(section(input, '文件：中文 空格 @目录/新建目录/新文件.txt'), /变更类型：已添加[\s\S]*\+NEW-ADDED-LINE/, '新增文件内容必须完整进入请求');
+    assert.doesNotMatch(input, /UNSELECTED-SIBLING|未选\.txt/, '未选兄弟不得进入请求');
+    assert.doesNotMatch(input, /UNTRACKED-CONTENT|未跟踪\.txt/, '未跟踪文件不得进入请求');
+  } finally {
+    await svc.close();
+    if (ui) await ui.close();
+    await cleanup(f.root);
+  }
+});
+
+test('整体目录删除、属性变化与二进制输入按类型表达；二进制内容未分析并明确告知用户', { timeout: 240000 }, async () => {
+  const f = await fixture();
+  const svc = await service((response, _request, schedule) => delayed(response, schedule, '删除与二进制的草稿', 0));
+  let ui;
+  try {
+    await fs.mkdir(path.join(f.scope, '待删目录'));
+    await fs.writeFile(path.join(f.scope, '待删目录', '旧.txt'), 'OLD-CONTENT\n');
+    svn(f.scope, 'add', '待删目录');
+    await fs.writeFile(path.join(f.scope, 'data.bin'), Buffer.from([1, 2, 3, 4]));
+    svn(f.scope, 'add', 'data.bin');
+    await fs.writeFile(path.join(f.scope, 'props.txt'), 'PLAIN\n');
+    svn(f.scope, 'add', 'props.txt');
+    svn(f.scope, 'commit', '-m', '二进制与删除基线');
+    svn(f.scope, 'delete', '待删目录');
+    await fs.writeFile(path.join(f.scope, 'data.bin'), Buffer.from([9, 8, 7, 6, 0]));
+    svn(f.scope, 'propset', 'svn:eol-style', 'native', 'props.txt');
+    ui = await host(f.root, f.scope, { 'codeSvn.ai.baseUrl': svc.url, 'codeSvn.ai.model': 'test-model' });
+    await ui.command('SVN：刷新变更');
+    await ui.chooseChange('SVN：加入待提交', '待删目录');
+    await ui.chooseChange('SVN：加入待提交', 'data.bin');
+    await ui.chooseChange('SVN：加入待提交', 'props.txt');
+    await setApiKey(ui);
+
+    await generateDraft(ui);
+    await eventually(async () => assert.match(await ui.notifications(), /草稿已填入/));
+    assert.equal(svc.requests.length, 1);
+    const input = JSON.parse(svc.requests[0].body).messages[1].content;
+    assert.match(input, /### 目录：中文 空格 @目录\/待删目录\n变更类型：已删除（整个目录）/, '整体目录删除必须明确表达');
+    assert.doesNotMatch(input, /OLD-CONTENT/, '删除目录不展开子项内容');
+    assert.match(input, /### 文件：中文 空格 @目录\/props\.txt\n变更类型：属性已修改\n属性变化：\n- svn:eol-style：新增为 "native"/, '无文本差异的属性变化不得被解释为无变化');
+    assert.match(input, /### 文件：中文 空格 @目录\/data\.bin\n变更类型：[^\n]*二进制/, '二进制只提供路径与变更类型');
+    const dataSection = input.slice(input.indexOf('### 文件：中文 空格 @目录/data.bin')).split('\n### ')[0];
+    assert.doesNotMatch(dataSection, /文本差异/, '二进制段落不含差异内容');
+    assert.match(await ui.notifications(), /二进制[\s\S]*未分析[\s\S]*data\.bin/, '必须明确告知二进制内容未分析');
+  } finally {
+    await svc.close();
+    if (ui) await ui.close();
+    await cleanup(f.root);
+  }
+});
+
+test('文本输入超过上限时停止请求并提示缩小选择；缩小后可以生成', { timeout: 240000 }, async () => {
+  const f = await fixture();
+  const svc = await service((response, _request, schedule) => delayed(response, schedule, '缩小后的草稿', 0));
+  let ui;
+  try {
+    const target = path.join(f.scope, '修改 中文.txt');
+    await fs.writeFile(target, `${'a'.repeat(70000)}\n`);
+    ui = await host(f.root, f.scope, { 'codeSvn.ai.baseUrl': svc.url, 'codeSvn.ai.model': 'test-model' });
+    await ui.command('SVN：刷新变更');
+    await ui.chooseChange('SVN：加入待提交', '修改 中文.txt');
+    await setApiKey(ui);
+
+    await generateDraft(ui);
+    await eventually(async () => assert.match(await ui.notifications(), /超过上限[\s\S]*缩小待提交选择/), 20000);
+    assert.equal(svc.requests.length, 0, '超限时不得发送任何请求，也不得截断或分段');
+
+    await fs.writeFile(target, 'small change\n');
+    await generateDraft(ui);
+    await eventually(async () => assert.match(await ui.notifications(), /草稿已填入/));
+    assert.equal(svc.requests.length, 1);
+    assert.match(JSON.parse(svc.requests[0].body).messages[1].content, /\+small change/);
   } finally {
     await svc.close();
     if (ui) await ui.close();

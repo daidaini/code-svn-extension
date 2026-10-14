@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import * as path from 'node:path';
 import { CommitSelection, WorkingCopyWrites, deletedTreeRoot, pathKey, within } from './commit-selection';
 import {
-  AiCancelled, DraftInput, AiSettings, apiKeySecret, collectDraftInput, configurationProblems, requestDraft
+  AiCancelled, DraftInput, AiSettings, apiKeySecret, assertInputWithinLimit, collectDraftInput, configurationProblems, requestDraft
 } from './ai';
 import {
   Change, changeLabel as label, HistoryEntry, ObjectLocation, PropertyChange, PropertyValue, QueryCancelled, RevisionPath, addPath, commitFiles, historyBatchSize,
@@ -451,8 +451,9 @@ export function activate(context: vscode.ExtensionContext): void {
     void vscode.window.showInformationMessage('API Key 已保存到 VS Code SecretStorage。');
   }
 
-  // Generation and commit share one commit selection. Only plain text content differences
-  // go out in this step; every other input is refused before the request is sent.
+  // Generation and commit share one commit selection. Inputs that cannot be described
+  // faithfully (conflicts, symbolic links, special states) or that exceed the size cap are
+  // refused before the request is sent.
   async function generate(sourceControl?: vscode.SourceControl): Promise<void> {
     const candidates = [...views.entries()];
     const candidate = sourceControl ? candidates.find(([, view]) => view.scm === sourceControl)
@@ -509,8 +510,9 @@ export function activate(context: vscode.ExtensionContext): void {
       }
       const collected = await collect();
       if (collected.unsupported.length > 0) {
-        throw new Error(`本次待提交包含尚不支持的输入：${collected.unsupported.join('；')}。当前只支持普通文本内容修改；属性、新增、删除、目录、冲突与二进制输入尚未支持，未发送请求。`);
+        throw new Error(`本次待提交包含尚不支持的输入：${collected.unsupported.join('；')}。这些输入当前无法安全描述，未发送请求。`);
       }
+      assertInputWithinLimit(collected.items);
       const original = view.scm.inputBox.value;
       if (original.trim()) {
         const action = await vscode.window.showWarningMessage('生成结果将替换当前提交信息，是否继续？',
@@ -549,7 +551,9 @@ export function activate(context: vscode.ExtensionContext): void {
         return;
       }
       view.scm.inputBox.value = draft;
-      void vscode.window.showInformationMessage('草稿已填入提交信息输入框，请审阅或修改后手动提交；插件不会自动提交。');
+      const binaryNote = collected.binary.length > 0
+        ? ` 以下二进制文件内容未分析，草稿未包含其内容：${collected.binary.join('、')}。` : '';
+      void vscode.window.showInformationMessage(`草稿已填入提交信息输入框，请审阅或修改后手动提交；插件不会自动提交。${binaryNote}`);
     } catch (error) {
       if (error instanceof AiCancelled) {
         void vscode.window.showInformationMessage('生成已取消；原提交信息保持不变。');
