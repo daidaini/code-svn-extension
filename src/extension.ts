@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import * as path from 'node:path';
 import { CommitSelection, WorkingCopyWrites, deletedTreeRoot, pathKey, within } from './commit-selection';
 import {
-  AiCancelled, DraftInput, AiSettings, apiKeySecret, assertInputWithinLimit, collectDraftInput, configurationProblems, requestDraft
+  AiCancelled, DraftInput, AiSettings, apiKeySecret, assertInputWithinLimit, collectDraftInput, draftBasis, configurationProblems, requestDraft
 } from './ai';
 import {
   Change, changeLabel as label, HistoryEntry, ObjectLocation, PropertyChange, PropertyValue, QueryCancelled, RevisionPath, addPath, commitFiles, historyBatchSize,
@@ -142,6 +142,10 @@ export function activate(context: vscode.ExtensionContext): void {
   const documentChanges = new vscode.EventEmitter<vscode.Uri>();
   const writes = new WorkingCopyWrites();
   const drafts = new Map<string, AbortController>();
+  // The input a filled draft was generated from, per working copy. `stale` makes the warning
+  // fire only on the transition; `queue` serialises checks.
+  interface DraftRecord { basis: string; stale: boolean; queue: Promise<unknown> }
+  const filledDrafts = new Map<string, DraftRecord>();
   let knownRoots = new Map<string, string>();
   let disposed = false;
   let pending = false;
@@ -215,6 +219,7 @@ export function activate(context: vscode.ExtensionContext): void {
         await choice.view.selected.add(change, openedFolders().map(folder => folder.uri.fsPath));
       }
       showChanges(choice.view, choice.view.changes);
+      reassessDrafts();
     } catch (error) {
       void vscode.window.showErrorMessage(error instanceof Error ? error.message : String(error));
     }
@@ -381,6 +386,62 @@ export function activate(context: vscode.ExtensionContext): void {
     } finally { release?.(); }
   }
 
+  // A draft is stale when the commit it describes no longer matches what the model saw:
+  // selection, file content, properties, or unsaved edits to a selected file. A check that
+  // fails cannot confirm the basis, so it counts as stale too.
+  function unsavedTargets(targets: string[]): boolean {
+    return vscode.workspace.textDocuments.some(document => document.uri.scheme === 'file'
+      && document.isDirty && targets.some(target => pathKey(target) === pathKey(document.uri.fsPath)));
+  }
+
+  async function checkDraft(key: string, record: DraftRecord): Promise<boolean> {
+    const view = views.get(key);
+    if (!view) { filledDrafts.delete(key); return false; }
+    const targets = view.selected.targets;
+    let stale = unsavedTargets(targets) || targets.length === 0 || view.lastError !== '';
+    if (!stale) {
+      const folder = openedFolders().find(candidate => within(candidate.uri.fsPath, targets[0]));
+      const collected = folder
+        ? await collectDraftInput(svnExecutable(folder), openedFolders().map(item => item.uri.fsPath), view.scm.rootUri!.fsPath, [...view.ancestors, ...view.changes], targets).catch(() => undefined)
+        : undefined;
+      stale = draftBasis(collected) !== record.basis;
+    }
+    if (filledDrafts.get(key) !== record) return false;
+    // The first transition warns once; a return to the generated input clears the mark silently.
+    if (stale && !record.stale) {
+      record.stale = true;
+      void vscode.window.showWarningMessage('AI 草稿已过期：提交选择或相关内容已变化，或无法确认。请重新生成草稿；若仍要使用，提交时需要明确确认。', '重新生成')
+        .then(action => { if (action === '重新生成') void generate(view.scm); });
+    } else if (!stale) {
+      record.stale = false;
+    }
+    return stale;
+  }
+
+  // Checks for one draft run one after another, so an older verdict cannot overwrite a newer one.
+  function assessDraft(key: string): Promise<boolean> {
+    const record = filledDrafts.get(key);
+    if (!record) return Promise.resolve(false);
+    const verdict = record.queue.then(() => checkDraft(key, record));
+    record.queue = verdict.catch(() => false);
+    return verdict;
+  }
+
+  function reassessDrafts(): void {
+    for (const key of filledDrafts.keys()) void assessDraft(key);
+  }
+
+  function isSelectedFile(uri: vscode.Uri): boolean {
+    return uri.scheme === 'file' && [...views.values()].some(view => view.selected.targets.some(target => pathKey(target) === pathKey(uri.fsPath)));
+  }
+
+  // Typing in a selected file fires on every keystroke; one check after a pause is enough.
+  let draftDebounce: ReturnType<typeof setTimeout> | undefined;
+  function scheduleDraftCheck(): void {
+    if (draftDebounce) clearTimeout(draftDebounce);
+    draftDebounce = setTimeout(reassessDrafts, 300);
+  }
+
   async function commit(sourceControl?: vscode.SourceControl): Promise<void> {
     const candidates = [...views.entries()];
     const candidate = sourceControl ? candidates.find(([, view]) => view.scm === sourceControl)
@@ -416,11 +477,17 @@ export function activate(context: vscode.ExtensionContext): void {
         await validate();
         if (dirty().length > 0) throw new Error('选中文件仍有未保存内容，提交已停止。');
       }
+      if (await assessDraft(key)) {
+        const action = await vscode.window.showWarningMessage('AI 草稿已过期：生成它所依据的提交选择或内容已变化。请先重新生成；如仍要提交这份过期草稿，请确认。',
+          { modal: true }, '仍然提交过期草稿');
+        if (action !== '仍然提交过期草稿') return;
+      }
       const folder = openedFolders().find(folder => within(folder.uri.fsPath, targets[0]))!;
       const revision = await commitFiles(svnExecutable(folder), view.scm.rootUri!.fsPath, targets, message);
       await refresh();
       if (views.get(key) !== view || view.lastError) throw new Error(`SVN 已产生修订 ${revision}，但刷新失败。请核对仓库结果，勿重复提交。`);
       view.selected.complete(targets);
+      filledDrafts.delete(key);
       if (view.scm.inputBox.value === message) view.scm.inputBox.value = '';
       showChanges(view, view.changes);
       void vscode.window.showInformationMessage(`SVN 提交成功：修订 ${revision}，${targets.length} 项变更（含必需提交依赖）。`);
@@ -529,7 +596,8 @@ export function activate(context: vscode.ExtensionContext): void {
       // differences, so a mismatch discards the result instead of filling a stale draft.
       const current = view.selected.targets;
       const sameSelection = current.length === targets.length
-        && targets.every(target => current.some(item => pathKey(item) === pathKey(target)));
+        && targets.every(target => current.some(item => pathKey(item) === pathKey(target)))
+        && !unsavedTargets(current);
       await refresh();
       if (views.get(key) !== view || view.lastError) {
         void vscode.window.showErrorMessage('生成完成但无法确认工作副本当前状态，草稿未填入；请刷新后重试。');
@@ -542,7 +610,7 @@ export function activate(context: vscode.ExtensionContext): void {
           verified = await collectDraftInput(executable, scopes, root, changed(), current);
         } catch { verified = undefined; }
       }
-      if (!verified || verified.unsupported.length > 0 || JSON.stringify(verified.items) !== JSON.stringify(collected.items)) {
+      if (draftBasis(verified) !== draftBasis(collected)) {
         void vscode.window.showInformationMessage('提交选择或相关内容在生成期间已变化，草稿未填入；请重新生成。');
         return;
       }
@@ -550,6 +618,7 @@ export function activate(context: vscode.ExtensionContext): void {
         void vscode.window.showInformationMessage('提交信息在生成期间已被修改，草稿未填入；需要时请重新生成。');
         return;
       }
+      filledDrafts.set(key, { basis: JSON.stringify(collected.items), stale: false, queue: Promise.resolve() });
       view.scm.inputBox.value = draft;
       const binaryNote = collected.binary.length > 0
         ? ` 以下二进制文件内容未分析，草稿未包含其内容：${collected.binary.join('、')}。` : '';
@@ -890,6 +959,7 @@ export function activate(context: vscode.ExtensionContext): void {
     if (!running) {
       running = (async () => {
         while (pending && !disposed) { pending = false; await refreshOnce(); }
+        reassessDrafts();
       })().finally(() => { running = undefined; });
     }
     return running;
@@ -930,12 +1000,13 @@ export function activate(context: vscode.ExtensionContext): void {
       }
     }),
     vscode.workspace.onDidCloseTextDocument(document => { documents.delete(document.uri.toString()); }),
+    vscode.workspace.onDidChangeTextDocument(event => { if (filledDrafts.size > 0 && isSelectedFile(event.document.uri)) scheduleDraftCheck(); }),
     vscode.workspace.onDidChangeWorkspaceFolders(() => { void refresh(); }),
     vscode.workspace.onDidChangeConfiguration(event => {
       if (event.affectsConfiguration('codeSvn.svnPath')) void refresh();
     }),
     { dispose() {
-      disposed = true; clearInterval(poll); if (debounce) clearTimeout(debounce);
+      disposed = true; clearInterval(poll); if (debounce) clearTimeout(debounce); if (draftDebounce) clearTimeout(draftDebounce);
       for (const watcher of watchers.values()) watcher.dispose();
       for (const view of views.values()) view.scm.dispose();
     } }

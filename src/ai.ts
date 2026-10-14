@@ -163,6 +163,12 @@ export function assertInputWithinLimit(items: DraftItem[]): void {
   }
 }
 
+// What a draft was generated from. Undefined when the input cannot be described at all.
+export function draftBasis(input: DraftInput | undefined): string | undefined {
+  if (!input || input.unsupported.length > 0) return undefined;
+  return JSON.stringify(input.items);
+}
+
 function lines(text: string): string[] {
   const parts = text.split(/\r\n|\r|\n/);
   if (parts.length > 0 && parts[parts.length - 1] === '') parts.pop();

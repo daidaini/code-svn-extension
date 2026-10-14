@@ -461,3 +461,136 @@ test('请求期间提交选择变化时丢弃结果，不填入过期草稿', { 
     await cleanup(f.root);
   }
 });
+
+test('草稿填入后未保存编辑或文件内容变化即标为过期；提交前需明确确认，取消不提交，重新生成后可提交', { timeout: 300000 }, async () => {
+  const f = await fixture();
+  let draftNumber = 0;
+  const svc = await service((response, _request, schedule) => {
+    draftNumber++;
+    delayed(response, schedule, `草稿第${draftNumber}版`, 0);
+  });
+  let ui;
+  try {
+    const target = path.join(f.scope, '修改 中文.txt');
+    await fs.writeFile(target, 'first\n');
+    ui = await host(f.root, f.scope, { 'codeSvn.ai.baseUrl': svc.url, 'codeSvn.ai.model': 'test-model' });
+    await ui.command('SVN：刷新变更');
+    await ui.chooseChange('SVN：加入待提交', '修改 中文.txt');
+    await setApiKey(ui);
+    await generateDraft(ui);
+    await eventually(async () => assert.match(await ui.notifications(), /草稿已填入/));
+    assert.match(await messageText(ui), /草稿第1版/);
+
+    // An unsaved edit makes the draft stale at once; the commit would save it and send different content.
+    await clearToasts(ui);
+    await ui.editFile(target, 'unsaved\n');
+    await eventually(async () => assert.match(await ui.notifications(), /草稿已过期/), 20000);
+    await ui.command('SVN：提交待提交文件', false);
+    const dialog = ui.page.locator('.monaco-dialog-box');
+    await eventually(async () => assert.match(await dialog.innerText(), /未保存内容/), 15000);
+    await confirmDialog(ui, '保存并提交');
+    await eventually(async () => assert.match(await dialog.innerText(), /草稿已过期/), 20000);
+    await confirmDialog(ui, '取消');
+    assert.equal(revision(f), 1, '过期草稿未经确认不得提交');
+
+    // Regenerate from the saved content, then change the file outside the editor.
+    await generateDraft(ui);
+    await confirmDialog(ui, '继续生成');
+    await eventually(async () => assert.match(await ui.notifications(), /草稿已填入/));
+    assert.match(await messageText(ui), /草稿第2版/);
+    await clearToasts(ui);
+    await fs.writeFile(target, 'second\n');
+    await ui.command('SVN：刷新变更');
+    await eventually(async () => assert.match(await ui.notifications(), /草稿已过期/), 20000);
+    await ui.command('SVN：提交待提交文件', false);
+    await eventually(async () => assert.match(await dialog.innerText(), /草稿已过期/), 20000);
+    await confirmDialog(ui, '取消');
+    assert.equal(revision(f), 1, '外部变更后的过期草稿未经确认不得提交');
+
+    await generateDraft(ui);
+    await confirmDialog(ui, '继续生成');
+    await eventually(async () => assert.match(await ui.notifications(), /草稿已填入/));
+    assert.match(await messageText(ui), /草稿第3版/);
+    await ui.command('SVN：提交待提交文件');
+    await eventually(async () => assert.equal(revision(f), 2), 20000);
+  } finally {
+    await svc.close();
+    if (ui) await ui.close();
+    await cleanup(f.root);
+  }
+});
+
+test('选择或属性变化使草稿过期；替换确认期间内容变化时结果不填入', { timeout: 300000 }, async () => {
+  const f = await fixture();
+  let draftNumber = 0;
+  const svc = await service((response, _request, schedule) => {
+    draftNumber++;
+    delayed(response, schedule, `草稿第${draftNumber}版`, 0);
+  });
+  let ui;
+  try {
+    const target = path.join(f.scope, '修改 中文.txt');
+    await fs.writeFile(target, 'first\n');
+    ui = await host(f.root, f.scope, { 'codeSvn.ai.baseUrl': svc.url, 'codeSvn.ai.model': 'test-model' });
+    await ui.command('SVN：刷新变更');
+    await ui.chooseChange('SVN：加入待提交', '修改 中文.txt');
+    await setApiKey(ui);
+    await generateDraft(ui);
+    await eventually(async () => assert.match(await ui.notifications(), /草稿已填入/));
+
+    await clearToasts(ui);
+    await ui.chooseChange('SVN：移出待提交', '修改 中文.txt');
+    await eventually(async () => assert.match(await ui.notifications(), /草稿已过期/), 20000);
+    await ui.chooseChange('SVN：加入待提交', '修改 中文.txt');
+    await delay(1000);
+
+    await clearToasts(ui);
+    svn(f.scope, 'propset', 'owner', 'team', '修改 中文.txt');
+    await ui.command('SVN：刷新变更');
+    await eventually(async () => assert.match(await ui.notifications(), /草稿已过期/), 20000);
+
+    // Changing the content while the replace confirmation is open must not fill the old result.
+    await clearToasts(ui);
+    await ui.commitMessage('已有的提交信息');
+    await generateDraft(ui);
+    const dialog = ui.page.locator('.monaco-dialog-box');
+    await dialog.waitFor();
+    await fs.writeFile(target, 'changed during dialog\n');
+    await delay(1500);
+    await confirmDialog(ui, '继续生成');
+    await eventually(async () => assert.match(await ui.notifications(), /生成期间已变化[\s\S]*草稿未填入/), 20000);
+    assert.equal(svc.requests.length, 2);
+    assert.match(await messageText(ui), /已有的提交信息/);
+    assert.doesNotMatch(await messageText(ui), /草稿第\d+版/);
+  } finally {
+    await svc.close();
+    if (ui) await ui.close();
+    await cleanup(f.root);
+  }
+});
+
+test('请求期间对选中文件的未保存编辑使结果不填入', { timeout: 240000 }, async () => {
+  const f = await fixture();
+  const svc = await service((response, _request, schedule) => delayed(response, schedule, '请求期间的草稿', 8000));
+  let ui;
+  try {
+    const target = path.join(f.scope, '修改 中文.txt');
+    await fs.writeFile(target, 'first\n');
+    ui = await host(f.root, f.scope, { 'codeSvn.ai.baseUrl': svc.url, 'codeSvn.ai.model': 'test-model' });
+    await ui.command('SVN：刷新变更');
+    await ui.chooseChange('SVN：加入待提交', '修改 中文.txt');
+    await setApiKey(ui);
+
+    await generateDraft(ui);
+    await eventually(async () => assert.equal(svc.requests.length, 1), 15000);
+    await ui.editFile(target, 'unsaved during request\n');
+    await eventually(async () => assert.match(await ui.notifications(), /生成期间已变化[\s\S]*草稿未填入/), 20000);
+    assert.equal(await messageText(ui), '', '未保存编辑发生在请求期间时不得填入结果');
+    assert.equal(await fs.readFile(target, 'utf8'), 'first\n', '生成不得保存选中文件');
+    assert.equal(revision(f), 1);
+  } finally {
+    await svc.close();
+    if (ui) await ui.close();
+    await cleanup(f.root);
+  }
+});
