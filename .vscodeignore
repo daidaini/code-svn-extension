@@ -1,0 +1,14 @@
+.agents/**
+.codex/**
+.workbuddy/**
+.codegraph/**
+.test-artifacts/**
+docs/**
+src/**
+test/**
+AGENTS.md
+GLOSSARY.md
+tsconfig.json
+**/*.map
+**/*.ts
+**/*.vsix

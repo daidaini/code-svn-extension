@@ -60,9 +60,14 @@ async function host(root, folder, settings = {}) {
   }
   if (!executable) throw new Error('请设置 VSCODE_EXECUTABLE 为 VS Code 主可执行文件路径');
   // A random free port chosen by Chromium; its file belongs to this isolated profile.
-  const child = spawn(executable, [folder, '--new-window', '--disable-extensions',
-    `--extensionDevelopmentPath=${path.resolve('.')}`, `--user-data-dir=${profile}`,
-    `--extensions-dir=${path.join(root, 'extensions')}`, '--remote-debugging-port=0',
+  // SVN_TEST_INSTALLED_EXTENSIONS_DIR runs the installed VSIX from an isolated extensions
+  // directory instead of the development build, so the installed package is what gets exercised.
+  const installed = process.env.SVN_TEST_INSTALLED_EXTENSIONS_DIR;
+  const args = installed
+    ? [folder, '--new-window', `--user-data-dir=${profile}`, `--extensions-dir=${installed}`]
+    : [folder, '--new-window', '--disable-extensions', `--extensionDevelopmentPath=${path.resolve('.')}`,
+      `--user-data-dir=${profile}`, `--extensions-dir=${path.join(root, 'extensions')}`];
+  const child = spawn(executable, [...args, '--remote-debugging-port=0',
     '--skip-welcome', '--skip-release-notes'], { windowsHide: true, stdio: 'ignore' });
   let browser;
   try {
