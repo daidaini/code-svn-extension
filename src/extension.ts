@@ -8,8 +8,8 @@ import {
   AiCancelled, DraftInput, AiSettings, apiKeySecret, assertInputWithinLimit, collectDraftInput, draftBasis, configurationProblems, requestDraft
 } from './ai';
 import {
-  Change, changeLabel as label, HistoryEntry, ObjectLocation, PropertyChange, PropertyValue, QueryCancelled, RevisionPath, addPath, commitFiles, historyBatchSize,
-  readChanges, readDifference, readHistoryBatch, readObjectLocation, readRevisionDifference, readRevisionPaths, readWorkingContent,
+  Change, ChangeContent, changeLabel as label, HistoryEntry, ObjectLocation, PropertyChange, PropertyValue, QueryCancelled, RevisionPath, addPath, commitFiles, historyBatchSize,
+  readChanges, readDifference, readFileRevisionDifference, readHistoryBatch, readObjectLocation, readRevisionDifference, readRevisionPaths, readWorkingContent,
   revertChanges, updateScopes, WorkingCopyQueryError
 } from './svn';
 import { ReviewSelection, runReview } from './review';
@@ -981,24 +981,47 @@ export function activate(context: vscode.ExtensionContext): void {
     let location: ObjectLocation | undefined;
     let hasMore = true;
     let closed = false;
+    let compareFrom: number | undefined;
+    const compareOther = { iconPath: new vscode.ThemeIcon('diff'), tooltip: '与另一修订比较' };
+    const compareHead = { iconPath: new vscode.ThemeIcon('arrow-up'), tooltip: '与最新版本（HEAD）比较' };
     picker.title = `SVN 历史：${name}`;
     picker.onDidHide(() => { closed = true; controller.abort(); picker.dispose(); });
     picker.onDidAccept(() => {
       const item = picker.selectedItems[0];
       if (item?.loadMore && !picker.busy) void load();
-      else if (item?.revision !== undefined && location && !picker.busy) void showRevision(item.revision, location);
+      else if (item?.revision !== undefined && location && !picker.busy) {
+        if (compareFrom !== undefined) {
+          if (compareFrom === item.revision) return;
+          picker.hide();
+          void showFileComparison(compareFrom, item.revision, location);
+        } else void showRevision(item.revision, location);
+      }
+    });
+    picker.onDidTriggerItemButton(event => {
+      if (picker.busy || !location || event.item.revision === undefined) return;
+      if (event.button === compareHead) {
+        picker.hide();
+        void showFileComparison(event.item.revision, 'HEAD', location);
+      } else if (event.button === compareOther) {
+        compareFrom = event.item.revision;
+        picker.title = `SVN 版本对比：${name} · 已选 r${compareFrom}`;
+        picker.value = '';
+        render();
+      }
     });
     const render = () => {
       picker.items = [
         ...entries.map((entry): HistoryItem => ({
           label: `r${entry.revision}`,
           revision: entry.revision,
+          buttons: location?.kind === 'file' && compareFrom === undefined ? [compareOther, compareHead] : undefined,
           description: `${entry.author || '（无作者）'} · ${formatDate(entry.date)}`,
           detail: entry.message.replace(/\s+/g, ' ').trim() || '（无提交信息）'
         })),
         ...(hasMore ? [{ label: `$(arrow-down) 加载更早的 ${historyBatchSize} 条`, alwaysShow: true, loadMore: true }] : [])
       ];
-      picker.placeholder = hasMore ? `已显示 ${entries.length} 条，最新优先` : `已显示全部 ${entries.length} 条，最新优先`;
+      picker.placeholder = compareFrom !== undefined ? `请选择与 r${compareFrom} 不同的另一修订，可加载更早记录；Esc 取消`
+        : hasMore ? `已显示 ${entries.length} 条，最新优先` : `已显示全部 ${entries.length} 条，最新优先`;
     };
     const load = async (): Promise<void> => {
       picker.busy = true;
@@ -1068,42 +1091,60 @@ export function activate(context: vscode.ExtensionContext): void {
       }
     }
 
+    async function showFileComparison(first: number, second: number | 'HEAD', target: ObjectLocation): Promise<void> {
+      try {
+        const content = await readFileRevisionDifference(executable, folderPath, target, first, second);
+        const range = `r${content.beforeRevision} → r${content.afterRevision}${second === 'HEAD' ? '（HEAD）' : ''}`;
+        await openHistoricalDifference(content, { path: scope, kind: 'file' }, range, `${target.url}&${range}`);
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        output.appendLine(`${new Date().toISOString()} 比较版本失败 r${first} → ${second} ${scope}\n${detail}`);
+        void vscode.window.showErrorMessage(`比较 ${name} 的版本失败：${detail} ${historyFailure(detail)}`, '查看日志')
+          .then(action => { if (action === '查看日志') output.show(); });
+      }
+    }
+
     async function showRevisionDifference(revision: number, target: ObjectLocation, change: RevisionPath): Promise<void> {
       const label = path.basename(change.path);
       try {
         const content = await readRevisionDifference(executable, folderPath, target, revision, change);
-        const properties = content.properties;
-        const uri = (side: 'base' | 'after' | 'properties') => vscode.Uri.from({
-          scheme: revisionScheme, path: change.path, query: `r=${revision}&side=${side}`
-        });
-        for (const [side, text] of [
-          ['base', content.base ?? ''], ['after', content.text ?? ''],
-          ['properties', propertyText(properties, change.path)]
-        ] as const) {
-          documents.set(uri(side).toString(), text);
-          documentChanges.fire(uri(side));
-        }
-        if (properties.length > 0) await vscode.window.showTextDocument(uri('properties'), { preview: false });
-        if (content.binary) {
-          void vscode.window.showWarningMessage(`${label}：r${revision} ${revisionLabel(change)}，但 SVN 没有提供文本差异，二进制内容不可分析，本次没有分析文件内容。`);
-          return;
-        }
-        if (change.kind === 'dir' && properties.length === 0) {
-          void vscode.window.showInformationMessage(`${label}：目录条目没有文本或属性差异，其子项变化已单独列出。`);
-          return;
-        }
-        if (content.base === content.text) {
-          if (properties.length === 0) void vscode.window.showInformationMessage(`${label}：r${revision} 没有文本内容差异。`);
-          return;
-        }
-        await vscode.commands.executeCommand('vscode.diff', uri('base'), uri('after'),
-          `${label}（r${revision} · ${revisionLabel(change)} · SVN 历史差异）`);
+        await openHistoricalDifference(content, change, `r${revision} · ${revisionLabel(change)}`, `${target.url}&r=${revision}`);
       } catch (error) {
         const detail = error instanceof Error ? error.message : String(error);
         output.appendLine(`${new Date().toISOString()} 查看历史差异失败 r${revision} ${change.path}\n${detail}`);
         void vscode.window.showErrorMessage(`查看 ${label} 的历史差异失败：${detail} ${historyFailure(detail)}`, '查看日志')
           .then(action => { if (action === '查看日志') output.show(); });
       }
+    }
+
+    async function openHistoricalDifference(content: ChangeContent, change: Pick<RevisionPath, 'path' | 'kind'>, description: string, key: string): Promise<void> {
+      const label = path.basename(change.path);
+      const properties = content.properties;
+      const uri = (side: 'base' | 'after' | 'properties') => vscode.Uri.from({
+        scheme: revisionScheme, path: change.path, query: `${encodeURIComponent(key)}&side=${side}`
+      });
+      for (const [side, text] of [
+        ['base', content.base ?? ''], ['after', content.text ?? ''],
+        ['properties', propertyText(properties, change.path)]
+      ] as const) {
+        documents.set(uri(side).toString(), text);
+        documentChanges.fire(uri(side));
+      }
+      if (properties.length > 0) await vscode.window.showTextDocument(uri('properties'), { preview: false });
+      if (content.binary) {
+        void vscode.window.showWarningMessage(`${label}：${description}，但 SVN 没有提供文本差异，二进制内容不可分析，本次没有分析文件内容。`);
+        return;
+      }
+      if (change.kind === 'dir' && properties.length === 0) {
+        void vscode.window.showInformationMessage(`${label}：目录条目没有文本或属性差异，其子项变化已单独列出。`);
+        return;
+      }
+      if (content.base === content.text) {
+        if (properties.length === 0) void vscode.window.showInformationMessage(`${label}：${description} 没有文本内容差异。`);
+        return;
+      }
+      await vscode.commands.executeCommand('vscode.diff', uri('base'), uri('after'),
+        `${label}（${description} · SVN 历史差异）`);
     }
 
     picker.show();

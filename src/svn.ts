@@ -430,6 +430,7 @@ export const historyBatchSize = 50;
 export interface ObjectLocation {
   url: string;
   root: string;
+  kind?: string;
 }
 
 // Object URL comes from the working copy's metadata; the history itself is
@@ -442,7 +443,7 @@ export async function readObjectLocation(executable: string, folder: string, tar
   if (typeof url !== 'string' || !url || typeof root !== 'string' || !root) {
     throw new Error('SVN 未返回对象地址，无法查询历史。');
   }
-  return { url, root };
+  return { url, root, kind: entry['@_kind'] };
 }
 
 // Repository paths are decoded, so both sides of a lineage comparison match.
@@ -460,7 +461,7 @@ function repoWithin(base: string, repoPath: string): boolean {
   return repoPath === base || repoPath.startsWith(base.endsWith('/') ? base : `${base}/`);
 }
 
-const noPathAtRevision = /(?:E|W)160013/;
+const noPathAtRevision = /(?:E|W)160013|E195012/;
 
 // The object's own repository path at a revision, found by walking svn's copy
 // history from HEAD. A move or rename changes the path; undefined means the
@@ -516,6 +517,27 @@ export async function readRevisionDifference(executable: string, folder: string,
   return {
     base: asText(beforeSide.bytes),
     text: asText(afterSide.bytes),
+    binary: [beforeSide.bytes, afterSide.bytes].some(content => content !== undefined && isBinary(content))
+      || isBinaryMime(beforeSide.properties, afterSide.properties),
+    properties: propertyChanges(beforeSide.properties, afterSide.properties)
+  };
+}
+
+// Resolve HEAD once, then read both immutable snapshots along this file's lineage.
+export async function readFileRevisionDifference(executable: string, folder: string, location: ObjectLocation, first: number, second: number | 'HEAD')
+  : Promise<ChangeContent & { beforeRevision: number; afterRevision: number }> {
+  const latest = second === 'HEAD'
+    ? Number(parse(await run(executable, folder, ['info', '--xml', '-r', 'HEAD', '--', `${location.url}@HEAD`])).info?.entry?.[0]?.['@_revision'])
+    : second;
+  if (!Number.isSafeInteger(latest) || latest < 1) throw new Error('SVN 未返回有效的最新修订号。');
+  const [beforeRevision, afterRevision] = [first, latest].sort((a, b) => a - b);
+  const [beforeSide, afterSide] = await Promise.all([beforeRevision, afterRevision].map(async revision => {
+    const filePath = await pathAt(executable, folder, location, revision);
+    return revisionSide(executable, folder, location, filePath === undefined ? undefined : { path: filePath, revision }, 'file');
+  }));
+  return {
+    beforeRevision, afterRevision,
+    base: asText(beforeSide.bytes), text: asText(afterSide.bytes),
     binary: [beforeSide.bytes, afterSide.bytes].some(content => content !== undefined && isBinary(content))
       || isBinaryMime(beforeSide.properties, afterSide.properties),
     properties: propertyChanges(beforeSide.properties, afterSide.properties)

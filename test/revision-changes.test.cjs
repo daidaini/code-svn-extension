@@ -88,6 +88,88 @@ async function openedDiff(ui) {
   return ui.diffSides();
 }
 
+async function compareRevision(ui, revision, action) {
+  await picker(ui).fill(`r${revision}`);
+  const row = ui.page.locator('.quick-input-list .monaco-list-row').filter({ hasText: new RegExp(`^r${revision}(?!\\d)`) }).first();
+  await row.hover();
+  await row.getByRole('button', { name: action, exact: true }).click();
+}
+
+test('任选两个修订可跨分页和移动路径比较，先选较新版本仍按旧到新显示', { timeout: 240000 }, async () => {
+  const f = await fixture();
+  let ui;
+  try {
+    const other = await peer(f);
+    const dir = path.basename(f.scope);
+    const first = commitPaths(other, 'before rename', [[path.join(dir, name), 'BEFORE RENAME\n']]);
+    const renamed = '重命名后 中文.txt';
+    svn(path.join(other, dir), 'move', '--', name, renamed);
+    commitRevision(other, 'rename', [dir]);
+    let latest;
+    for (let index = 1; index <= 51; index++) {
+      latest = commitPaths(other, `later ${index}`, [[path.join(dir, renamed), `LATER ${index}\n`]]);
+    }
+    svn(f.wc, 'update');
+    await fs.writeFile(path.join(f.scope, renamed), 'LOCAL DRAFT\n');
+    ui = await host(f.root, f.scope);
+    await openHistory(ui, renamed);
+    await compareRevision(ui, latest, '与另一修订比较');
+    await picker(ui).fill('加载更早');
+    await ui.page.keyboard.press('Enter');
+    await picker(ui).fill(`r${first}`);
+    await eventually(async () => assert.match((await rowTexts(ui))[0] ?? '', new RegExp(`^r${first}(?!\\d)`)));
+    await ui.page.keyboard.press('Enter');
+    const sides = await openedDiff(ui);
+    assert.match(sides.original, /BEFORE RENAME/);
+    assert.match(sides.modified, /LATER 51/);
+    assert.doesNotMatch(sides.original + sides.modified, /LOCAL DRAFT/);
+    assert.match(await ui.editorTabs(), new RegExp(`r${first} → r${latest}`));
+  } finally {
+    if (ui) await ui.close();
+    await cleanup(f.root);
+  }
+});
+
+test('与最新版本比较在点击时读取服务器 HEAD，不使用打开历史时的记录或本地内容', { timeout: 120000 }, async () => {
+  const f = await fixture();
+  let ui;
+  try {
+    const other = await peer(f);
+    const relative = path.join(path.basename(f.scope), name);
+    const first = commitPaths(other, 'first snapshot', [[relative, 'FIRST SNAPSHOT\n']]);
+    ui = await host(f.root, f.scope);
+    await openHistory(ui, name);
+    const latest = commitPaths(other, 'new server snapshot', [[relative, 'LATEST SNAPSHOT\n']]);
+    await compareRevision(ui, first, '与最新版本（HEAD）比较');
+    const sides = await openedDiff(ui);
+    assert.match(sides.original, /FIRST SNAPSHOT/);
+    assert.match(sides.modified, /LATEST SNAPSHOT/);
+    assert.match(await ui.editorTabs(), new RegExp(`r${first} → r${latest}（HEAD）`));
+  } finally {
+    if (ui) await ui.close();
+    await cleanup(f.root);
+  }
+});
+
+test('选择相同修订保持选择列表，取消两版本比较后不打开差异', { timeout: 120000 }, async () => {
+  const f = await fixture();
+  let ui;
+  try {
+    ui = await host(f.root, f.scope);
+    await openHistory(ui, name);
+    await compareRevision(ui, 1, '与另一修订比较');
+    await picker(ui).fill('r1');
+    await ui.page.keyboard.press('Enter');
+    await eventually(async () => assert.match(await placeholder(ui), /请选择与 r1 不同的另一修订/));
+    await ui.page.keyboard.press('Escape');
+    await picker(ui).waitFor({ state: 'hidden' });
+    assert.equal(await ui.diffCount(), 0);
+  } finally {
+    if (ui) await ui.close();
+    await cleanup(f.root);
+  }
+});
+
 test('点击修订只列出所查询文件的变化，差异使用提交前后的历史内容而非本地草稿', { timeout: 180000 }, async () => {
   const f = await fixture();
   let ui;
