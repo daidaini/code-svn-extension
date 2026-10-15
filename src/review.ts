@@ -68,7 +68,6 @@ const maxInputCharacters = 60_000;
 const relative = (root: string, target: string) => path.relative(root, target).split(path.sep).join('/') || '.';
 const unique = (values: string[]) => [...new Map(values.map(value => [pathKey(value), value])).values()];
 const lineCount = (text: string) => text ? text.replace(/\r\n/g, '\n').split('\n').length - (text.endsWith('\n') ? 1 : 0) : 0;
-const numbered = (text: string) => text.replace(/\r\n/g, '\n').split('\n').slice(0, lineCount(text)).map((line, index) => `${index + 1} | ${line}`).join('\n');
 
 function normalizeSelection(input: SelectionInput): ReviewSelection {
   const folders = unique(('scopes' in input ? input.scopes : [input.scope]).map(folder => path.resolve(folder))).sort();
@@ -222,11 +221,6 @@ function buildMessages(prompt: string, root: string, files: ReviewFile[], intent
       copy_source: item.change.copiedFrom ? { path: item.change.copiedFrom.repoPath, revision: item.change.copiedFrom.rev } : undefined,
       diff: item.diff, properties: item.content.properties,
     })).join('\n'),
-    relevant_selected_files_functions_types_callers_tests: files.filter(item => !item.content.binary && item.kind === 'file').map(item => JSON.stringify({
-      file: item.file, side: item.change.item === 'deleted' ? 'old' : 'new',
-      version: item.change.item === 'deleted' ? '基线版本' : '本次提交选择的工作副本版本',
-      content: numbered(item.change.item === 'deleted' ? item.content.base ?? '' : item.content.text ?? '')
-    })).join('\n')
   };
   const system = prompt.slice('# System Prompt'.length, index).trim();
   let user = prompt.slice(index + marker.length).replace(/\{\{([^}]+)\}\}/g, (_match, key) => {
