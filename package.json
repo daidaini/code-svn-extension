@@ -2,8 +2,12 @@
   "name": "code-svn-extension",
   "displayName": "Code SVN",
   "description": "在打开目录内管理 SVN 项目",
-  "version": "0.1.0",
+  "version": "0.1.3",
   "publisher": "daidaini",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/daidaini/code-svn-extension.git"
+  },
   "private": true,
   "engines": { "vscode": "^1.100.0" },
   "categories": ["SCM Providers"],
@@ -26,7 +30,7 @@
       { "command": "codeSvn.unselect", "title": "SVN：移出待提交", "icon": "$(remove)" },
       { "command": "codeSvn.commit", "title": "SVN：提交待提交文件", "icon": "$(check)" },
       { "command": "codeSvn.generateDraft", "title": "SVN：生成提交信息草稿", "icon": "$(sparkle)" },
-      { "command": "codeSvn.review", "title": "SVN：审查待提交", "icon": "$(sparkle)" },
+      { "command": "codeSvn.review", "title": "SVN：审查待提交", "icon": "$(eye)" },
       { "command": "codeSvn.reviewAndCommit", "title": "SVN：审查并提交", "icon": "$(check-all)" },
       { "command": "codeSvn.showReviewResults", "title": "SVN：查看审查结果" },
       { "command": "codeSvn.setApiKey", "title": "SVN：配置 AI API Key" },

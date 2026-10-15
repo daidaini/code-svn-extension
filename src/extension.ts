@@ -507,7 +507,6 @@ export function activate(context: vscode.ExtensionContext): void {
     if (!targets.length) { void vscode.window.showWarningMessage('没有待提交文件，请先加入待提交。'); return; }
     const commitMessage = view.scm.inputBox.value;
     const intent = commitMessage.trim();
-    if (commitAfter && !intent) { void vscode.window.showWarningMessage('审查并提交需要先填写提交信息。'); return; }
     let selection: ReviewSelection;
     try {
       await refresh();
@@ -597,8 +596,8 @@ export function activate(context: vscode.ExtensionContext): void {
       const reason = reviewRuns.get(key)?.invalidReason;
       entry.status = reason ? 'stale' : controller.signal.aborted ? 'cancelled' : 'error';
       if (reason) entry.staleReason = reason;
-      entry.result = { status: 'error', findings: [], context_requests: [], requests: 0,
-        coverage: { root: entry.root, scope: selection.scopes[0], scopes: selection.scopes, selected: [], dependencies: [], files: [], binary: [], context: [] },
+      entry.result = { status: 'error', findings: [], requests: 0,
+        coverage: { root: entry.root, scope: selection.scopes[0], scopes: selection.scopes, selected: [], files: [] },
         error: error instanceof Error ? error.message : String(error) };
     } finally {
       reviewRuns.delete(key); release(); finish();
@@ -639,7 +638,16 @@ export function activate(context: vscode.ExtensionContext): void {
       { modal: true }, entry.status === 'findings' ? '仍然提交（有审查问题）' : '仍然提交（审查未完成）');
     if ((entry.status === 'clean' && action === '确认提交')
       || (entry.status === 'findings' && action === '仍然提交（有审查问题）')
-      || (entry.status === 'incomplete' && action === '仍然提交（审查未完成）')) await commit(view.scm, entry);
+      || (entry.status === 'incomplete' && action === '仍然提交（审查未完成）')) {
+      let message: string | undefined;
+      if (!view.scm.inputBox.value.trim()) {
+        message = await vscode.window.showInputBox({
+          title: 'SVN 提交信息', prompt: '审查不要求提交信息；提交前请输入提交信息。', ignoreFocusOut: true
+        });
+        if (!message?.trim()) return;
+      }
+      await commit(view.scm, entry, message);
+    }
   }
 
   function invalidateCompletedReviews(reason: string): void {
@@ -652,7 +660,7 @@ export function activate(context: vscode.ExtensionContext): void {
     }
   }
 
-  async function commit(sourceControl?: vscode.SourceControl, reviewed?: ReviewEntry): Promise<void> {
+  async function commit(sourceControl?: vscode.SourceControl, reviewed?: ReviewEntry, messageOverride?: string): Promise<void> {
     const candidates = [...views.entries()];
     const candidate = sourceControl ? candidates.find(([, view]) => view.scm === sourceControl)
       : candidates.length === 1 ? candidates[0]
@@ -667,7 +675,7 @@ export function activate(context: vscode.ExtensionContext): void {
     }
     const targets = view.selected.targets;
     if (targets.length === 0) { void vscode.window.showWarningMessage('没有待提交文件，请先加入待提交。'); return; }
-    const message = view.scm.inputBox.value;
+    const message = messageOverride ?? view.scm.inputBox.value;
     if (!message.trim()) { void vscode.window.showWarningMessage('请输入提交信息。'); return; }
     const release = writes.tryAcquire(key);
     if (!release) return;

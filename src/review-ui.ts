@@ -19,7 +19,7 @@ export interface ReviewEntry {
   staleReason?: string;
 }
 
-type NodeAction = 'report' | 'finding' | 'review' | 'commit' | 'context' | 'binary';
+type NodeAction = 'report' | 'finding' | 'review' | 'commit';
 
 interface ReviewNode extends vscode.TreeItem {
   entry: ReviewEntry;
@@ -62,11 +62,7 @@ export class ReviewResults implements vscode.TreeDataProvider<ReviewNode>, vscod
     result?.findings.forEach((finding, index) => items.push(this.node(entry,
       `[${finding.severity}] ${finding.title}  ${finding.file}:${finding.line_start}`, 'finding',
       vscode.TreeItemCollapsibleState.None, index, finding)));
-    result?.context_requests.forEach((item, index) => items.push(this.node(entry,
-      `需补充：${item.file_or_symbol}`, 'context', vscode.TreeItemCollapsibleState.None, index)));
-    result?.coverage.binary.forEach((file, index) => items.push(this.node(entry,
-      `二进制内容未分析：${file}`, 'binary', vscode.TreeItemCollapsibleState.None, index)));
-    items.push(this.node(entry, `覆盖范围：${result?.coverage.files.length ?? 0} 项变更`, 'report', vscode.TreeItemCollapsibleState.None));
+    items.push(this.node(entry, `已审查：${result?.coverage.files.length ?? 0} 项文本变更`, 'report', vscode.TreeItemCollapsibleState.None));
     items.push(this.node(entry, '查看完整审查报告', 'report', vscode.TreeItemCollapsibleState.None));
     if (entry.status === 'clean' || entry.status === 'findings' || entry.status === 'incomplete') {
       items.push(this.node(entry, '重新审查', 'review', vscode.TreeItemCollapsibleState.None));
@@ -83,7 +79,6 @@ export class ReviewResults implements vscode.TreeDataProvider<ReviewNode>, vscod
       await this.openSnapshot(node.entry, location);
       return;
     }
-    if (node.action === 'context' || node.action === 'binary') return;
     await this.show(node.entry);
   }
 
@@ -152,10 +147,7 @@ export class ReviewResults implements vscode.TreeDataProvider<ReviewNode>, vscod
     if (!result) return output.join('\n') + '\n\n审查尚未完成。';
     output.push(`管理范围：${(result.coverage.scopes ?? [result.coverage.scope]).join('、')}`,
       `提交选择：${result.coverage.selected.join('、') || '（空）'}`,
-      `必需提交依赖：${result.coverage.dependencies.join('、') || '（无）'}`,
-      `审查输入：${result.coverage.files.join('、') || '（无）'}`,
-      `补充上下文：${result.coverage.context.join('、') || '（无）'}`,
-      `二进制未分析：${result.coverage.binary.join('、') || '（无）'}`,
+      `已审查文本变更：${result.coverage.files.length} 项`,
       `模型请求：${result.requests} 次`);
     if (result.error) output.push('', `说明：${result.error}`);
     for (const [index, finding] of result.findings.entries()) {
@@ -164,7 +156,6 @@ export class ReviewResults implements vscode.TreeDataProvider<ReviewNode>, vscod
         `触发：${finding.trigger}`, `证据：${finding.evidence}`, `后果：${finding.impact}`,
         `建议：${finding.suggestion}`, `验证：${finding.verification}`);
     }
-    for (const item of result.context_requests) output.push('', `仍需上下文：${item.file_or_symbol}`, item.reason);
     return output.join('\n');
   }
 
@@ -184,8 +175,6 @@ export class ReviewResults implements vscode.TreeDataProvider<ReviewNode>, vscod
     item.id = `${entry.id}:${action}:${index ?? ''}:${label}`;
     if (action !== 'report') item.command = { command: 'codeSvn.reviewActivate', title: label, arguments: [item] };
     if (action === 'finding') item.iconPath = new vscode.ThemeIcon(finding?.severity === 'high' ? 'error' : finding?.severity === 'medium' ? 'warning' : 'info');
-    if (action === 'context') item.iconPath = new vscode.ThemeIcon('question');
-    if (action === 'binary') item.iconPath = new vscode.ThemeIcon('file-binary');
     return item;
   }
 

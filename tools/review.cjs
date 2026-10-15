@@ -78,23 +78,19 @@ async function configuration(options) {
 function report(result) {
   const labels = {
     clean: '已提供范围内未发现符合提示词要求的问题。', findings: '发现审查问题。',
-    incomplete: '审查不完整，请查看未分析内容和上下文请求。', stale: '审查结果已过期，请重新审查。', error: '审查失败。'
+    incomplete: '审查不完整，请检查本次审查范围。', stale: '审查结果已过期，请重新审查。', error: '审查失败。'
   };
   const lines = [labels[result.status]];
   if (result.error) lines.push(result.error);
   if (result.coverage) {
     lines.push(`管理范围：${result.coverage.scope}`, `提交选择：${result.coverage.selected.join('、')}`);
-    if (result.coverage.dependencies.length) lines.push(`必需提交依赖：${result.coverage.dependencies.join('、')}`);
-    lines.push(`覆盖 ${result.coverage.files.length} 项变更；模型请求 ${result.requests} 次。`);
-    if (result.coverage.context.length) lines.push(`补充 BASE 上下文：${result.coverage.context.join('、')}`);
-    if (result.coverage.binary.length) lines.push(`二进制内容未分析：${result.coverage.binary.join('、')}`);
+    lines.push(`已审查 ${result.coverage.files.length} 项文本变更；模型请求 ${result.requests} 次。`);
   }
   for (const finding of result.findings) {
     lines.push('', `[${finding.severity}] ${finding.file}:${finding.line_start}-${finding.line_end} (${finding.side}) ${finding.title}`,
       `触发：${finding.trigger}`, `证据：${finding.evidence}`, `后果：${finding.impact}`,
       `修复：${finding.suggestion}`, `验证：${finding.verification}`);
   }
-  for (const request of result.context_requests) lines.push(`需补充：${request.file_or_symbol} — ${request.reason}`);
   return lines.join('\n');
 }
 
@@ -124,7 +120,7 @@ async function main() {
     result = await core.reviewSelection(selection, config.settings, config.apiKey, prompt, options.intent, controller.signal);
     process.exitCode = core.reviewExitCodes[result.status];
   } catch (error) {
-    result = { status: 'error', findings: [], context_requests: [], requests: 0, error: error.message };
+    result = { status: 'error', findings: [], requests: 0, error: error.message };
     process.exitCode = 2;
   } finally { process.removeListener('SIGINT', cancel); }
   if (controller.signal.aborted) process.exitCode = 130;

@@ -20,13 +20,13 @@ svn --version
 
 ## 安装 VSIX
 
-取得 `code-svn-extension-0.1.0.vsix` 后，可用以下任一方式安装：
+取得 `code-svn-extension-0.1.3.vsix` 后，可用以下任一方式安装：
 
 1. 打开 VS Code 扩展视图（`Ctrl+Shift+X`），选择右上角 `…` → **从 VSIX 安装…**，再选择 VSIX 文件。
 2. 在终端执行：
 
    ```sh
-   code --install-extension code-svn-extension-0.1.0.vsix
+   code --install-extension code-svn-extension-0.1.3.vsix
    ```
 
 安装完成后按提示重新加载 VS Code。当前工作区中的 VSIX 文件位于仓库根目录；它是本地打包产物，不随 Git 源码提交。
@@ -50,6 +50,48 @@ npm run build
 ```
 
 用 VS Code 打开仓库，按 `F5` 启动 **调试 Code SVN**。在新开的扩展开发窗口中打开 SVN 工作副本。此方式用于源码调试；普通使用请安装 VSIX。
+
+### 从源码构建 VSIX
+
+以下命令适用于 Linux、WSL 或 macOS 的 shell。在仓库根目录运行；需要 Node.js 22 或更新版本、npm，以及可下载 `@vscode/vsce` 的网络。
+
+构建过程先编译 TypeScript，再在临时 staging 目录组装 VSIX 所需文件。仓库的 `.gitignore` 忽略 `dist/`，所以不能直接从仓库根目录打包。staging 目录只放扩展清单、README、编译后的 JavaScript、审查提示词和生产依赖；生产依赖放在 `dist/node_modules`，以便编译文件运行时可以解析。`vsce ls` 会在打包前显示实际文件清单。
+
+```sh
+set -eu
+repo="$PWD"
+version="$(node -p "require('./package.json').version")"
+
+npm ci
+npm run build
+
+stage="$(mktemp -d)"
+trap 'rm -rf "$stage"' EXIT
+mkdir -p "$stage/dist" "$stage/tools"
+cp package.json package-lock.json README.md "$stage/"
+cp dist/*.js "$stage/dist/"
+cp tools/review_prompt.md "$stage/tools/"
+printf '%s\n' 'package-lock.json' '**/*.map' '**/*.ts' '**/*.vsix' > "$stage/.vscodeignore"
+
+npm ls --omit=dev --all --parseable \
+  | tail -n +2 \
+  | while IFS= read -r dependency; do
+      relative="${dependency#"$repo/node_modules/"}"
+      mkdir -p "$stage/dist/node_modules/$(dirname "$relative")"
+      cp -R "$dependency" "$stage/dist/node_modules/$relative"
+    done
+
+(cd "$stage" && npx --yes --package @vscode/vsce@4.0.0 vsce ls --tree --no-dependencies)
+(cd "$stage" && npx --yes --package @vscode/vsce@4.0.0 vsce package --no-dependencies \
+  --out "$repo/code-svn-extension-$version.vsix")
+```
+
+`package.json` 的 `version` 决定输出文件名，例如 `0.1.3` 会生成 `code-svn-extension-0.1.3.vsix`。打包后可检查包内关键文件：
+
+```sh
+unzip -l "code-svn-extension-$version.vsix" \
+  | grep -E 'extension/(dist/(extension|review|review-ui)\.js|tools/review_prompt\.md|dist/node_modules/fast-xml-parser/)'
+```
 
 ## 配置 SVN
 

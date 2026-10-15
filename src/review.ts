@@ -2,7 +2,7 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { AiSettings, requestMessages, textDiff } from './ai';
 import { CommitSelection, deletedTreeRoot, pathKey, within } from './commit-selection';
-import { Change, ChangeContent, changeLabel, readBaseContent, readChanges, readDifference } from './svn';
+import { Change, ChangeContent, changeLabel, readChanges, readDifference } from './svn';
 
 export interface ReviewSelection {
   executable: string;
@@ -52,16 +52,13 @@ export interface ReviewFinding {
   verification: string;
 }
 
-export interface ContextRequest { file_or_symbol: string; reason: string }
-interface ModelReview { findings: ReviewFinding[]; context_requests: ContextRequest[] }
+interface ModelReview { findings: ReviewFinding[] }
 interface ReviewFile { file: string; change: Change; kind: 'file' | 'dir'; content: ChangeContent; diff: string }
-interface ContextFile { file: string; version: 'BASE'; content: string }
 export interface ReviewResult extends ModelReview {
   status: 'clean' | 'findings' | 'incomplete' | 'stale' | 'error';
   requests: number;
   coverage: {
-    root: string; scope: string; scopes?: string[]; selected: string[]; dependencies: string[];
-    files: string[]; binary: string[]; context: string[];
+    root: string; scope: string; scopes?: string[]; selected: string[]; files: string[];
   };
   error?: string;
 }
@@ -208,7 +205,7 @@ async function collect(selection: ReviewSelection): Promise<ReviewFile[]> {
   return files;
 }
 
-function buildMessages(prompt: string, root: string, files: ReviewFile[], contexts: ContextFile[], intent: string): { system: string; user: string } {
+function buildMessages(prompt: string, root: string, files: ReviewFile[], intent: string): { system: string; user: string } {
   const marker = '# User Prompt 模板';
   const index = prompt.indexOf(marker);
   if (!prompt.startsWith('# System Prompt') || index < 0) throw new Error('审查提示词缺少 System Prompt 或 User Prompt 模板。');
@@ -218,13 +215,12 @@ function buildMessages(prompt: string, root: string, files: ReviewFile[], contex
     change_intent_or_unknown: intent || '未提供。',
     relevant_project_rules: '未提供额外项目约定。',
     lint_typecheck_tests_results_or_not_run: '未执行；本工具不运行 lint、类型检查、测试或编译。',
-    selected_diff_with_old_and_new_line_numbers: files.map(item => JSON.stringify({
+    selected_diff_with_old_and_new_line_numbers: files.filter(item => !item.content.binary).map(item => JSON.stringify({
       file: item.file, kind: item.kind, status: changeLabel(item.change),
       moved_from: item.change.movedFrom ? relative(root, item.change.movedFrom) : undefined,
       moved_to: item.change.movedTo ? relative(root, item.change.movedTo) : undefined,
       copy_source: item.change.copiedFrom ? { path: item.change.copiedFrom.repoPath, revision: item.change.copiedFrom.rev } : undefined,
       diff: item.diff, properties: item.content.properties,
-      binary: item.content.binary, note: item.content.binary ? '二进制内容未分析。' : undefined
     })).join('\n'),
     relevant_selected_files_functions_types_callers_tests: files.filter(item => !item.content.binary && item.kind === 'file').map(item => JSON.stringify({
       file: item.file, side: item.change.item === 'deleted' ? 'old' : 'new',
@@ -237,27 +233,24 @@ function buildMessages(prompt: string, root: string, files: ReviewFile[], contex
     if (!(key in values)) throw new Error(`审查提示词包含未知占位符：${key}`);
     return values[key];
   }).trim();
-  if (contexts.length) user += `\n\n## 补充上下文（未选择文件的 BASE，不包含其本地修改）\n${contexts.map(item => JSON.stringify({ ...item, content: numbered(item.content) })).join('\n')}`;
   return { system, user };
 }
 
-function parseReview(text: string, files: ReviewFile[], contexts: ContextFile[]): ModelReview {
+function parseReview(text: string, files: ReviewFile[]): ModelReview {
   let result: any;
   try { result = JSON.parse(text); } catch { throw new Error('审查结果不是合法 JSON。'); }
-  const fail = () => { throw new Error('审查结果不符合约定结构、文件范围或行号。'); };
-  if (!result || !Array.isArray(result.findings) || !Array.isArray(result.context_requests)
-    || result.findings.length > 3 || result.context_requests.length > 3) fail();
+  const fail = (): never => { throw new Error('审查结果不符合约定结构、文件范围或行号。'); };
+  if (!result || !Array.isArray(result.findings) || result.findings.length > 3) fail();
   const findings = result.findings.map((item: any): ReviewFinding => {
     if (!item || typeof item !== 'object') return fail();
     const fields = ['file', 'title', 'trigger', 'evidence', 'impact', 'suggestion', 'verification'] as const;
     if (fields.some(field => typeof item[field] !== 'string' || !item[field].trim())) fail();
     const file = files.find(file => file.file === item.file && file.kind === 'file' && !file.content.binary);
-    const context = contexts.find(file => file.file === item.file);
-    if ((!file && !context) || !['high', 'medium', 'low'].includes(item.severity) || item.confidence !== 'high'
+    if (!file) throw new Error('审查结果不符合约定结构、文件范围或行号。');
+    if (!['high', 'medium', 'low'].includes(item.severity) || item.confidence !== 'high'
       || !['new', 'old'].includes(item.side) || !Number.isInteger(item.line_start) || !Number.isInteger(item.line_end)
       || item.line_start < 1 || item.line_end < item.line_start) fail();
-    if (context && item.side !== 'old') fail();
-    const count = lineCount(context?.content ?? (item.side === 'new' ? file!.content.text ?? '' : file!.content.base ?? ''));
+    const count = lineCount(item.side === 'new' ? file.content.text ?? '' : file.content.base ?? '');
     if (item.line_end > count) fail();
     // Old text of a modified file is provided through its diff, not as a full file.
     if (item.side === 'old' && file && file.change.item !== 'deleted') {
@@ -270,21 +263,7 @@ function parseReview(text: string, files: ReviewFile[], contexts: ContextFile[])
       evidence: item.evidence, impact: item.impact, suggestion: item.suggestion, verification: item.verification
     };
   });
-  const context_requests = result.context_requests.map((item: any): ContextRequest => {
-    if (!item || typeof item.file_or_symbol !== 'string' || !item.file_or_symbol.trim()
-      || typeof item.reason !== 'string' || !item.reason.trim()) return fail();
-    return { file_or_symbol: item.file_or_symbol, reason: item.reason };
-  });
-  return { findings, context_requests };
-}
-
-async function contextFile(selection: ReviewSelection, value: string): Promise<ContextFile> {
-  if (path.isAbsolute(value) || /^[A-Za-z]:|\\/.test(value)) throw new Error('上下文必须是工作副本相对路径。');
-  const target = path.resolve(selection.root, value);
-  const scope = await scopedPath(selection, target);
-  const content = await readBaseContent(selection.executable, scope, selection.root, target);
-  if (content.binary || content.symbolicLink || content.text === undefined) throw new Error('上下文不是普通文本文件。');
-  return { file: relative(selection.root, target), version: 'BASE', content: content.text };
+  return { findings };
 }
 
 // Keep the CLI result contract; host sessions additionally retain review evidence.
@@ -298,24 +277,19 @@ export async function runReview(input: ReviewInput, signal?: AbortSignal): Promi
   const selection = normalizeSelection(input.selection);
   const { settings, apiKey, prompt, intent = '' } = input;
   const result: ReviewResult = {
-    status: 'error', findings: [], context_requests: [], requests: 0,
+    status: 'error', findings: [], requests: 0,
     coverage: {
       root: selection.root, scope: selection.scopes[0],
       ...(selection.scopes.length > 1 ? { scopes: selection.scopes } : {}),
       selected: selection.explicit.map(target => relative(selection.root, target)),
-      dependencies: selection.dependencies.map(target => relative(selection.root, target)),
-      files: [], binary: [], context: []
+      files: []
     }
   };
   let files: ReviewFile[] = [];
-  const contexts: ContextFile[] = [];
   let basis: string | undefined;
   const unchanged = async () => {
     try {
       if (basis === undefined || JSON.stringify(await collect(selection)) !== basis) return false;
-      for (const item of contexts) {
-        if (JSON.stringify(await contextFile(selection, item.file)) !== JSON.stringify(item)) return false;
-      }
       return true;
     } catch { return false; }
   };
@@ -330,8 +304,7 @@ export async function runReview(input: ReviewInput, signal?: AbortSignal): Promi
     snapshot(finding) {
       if (!result.findings.includes(finding)) throw new Error('该问题不属于本次审查结果。');
       const file = files.find(item => item.file === finding.file);
-      const context = contexts.find(item => item.file === finding.file);
-      const text = context?.content ?? (finding.side === 'old' ? file?.content.base : file?.content.text);
+      const text = finding.side === 'old' ? file?.content.base : file?.content.text;
       if (text === undefined) throw new Error('审查快照不可用。');
       return { file: finding.file, side: finding.side, text, lineStart: finding.line_start, lineEnd: finding.line_end };
     }
@@ -339,38 +312,20 @@ export async function runReview(input: ReviewInput, signal?: AbortSignal): Promi
   const stale = () => { result.status = 'stale'; result.error = '审查依据已变化，请重新审查。'; return session; };
   try {
     files = await collect(selection);
-    result.coverage.files = files.map(item => item.file);
-    result.coverage.binary = files.filter(item => item.content.binary).map(item => item.file);
+    result.coverage.files = files.filter(item => !item.content.binary).map(item => item.file);
     basis = JSON.stringify(files);
     const request = async () => {
-      const messages = buildMessages(prompt, selection.root, files, contexts, intent);
+      const messages = buildMessages(prompt, selection.root, files, intent);
       if (messages.system.length + messages.user.length > maxInputCharacters) throw new Error('审查输入超过 60,000 字符，请缩小提交选择。');
       if (signal?.aborted) throw new Error('审查已取消。');
       result.requests++;
-      return parseReview(await requestMessages(settings, apiKey, messages, signal), files, contexts);
+      return parseReview(await requestMessages(settings, apiKey, messages, signal), files);
     };
     if (!await unchanged()) return stale();
-    let review = await request();
+    const review = await request();
     if (!await unchanged()) return stale();
-    const unresolved: ContextRequest[] = [];
-    for (const item of review.context_requests) {
-      try {
-        const target = path.resolve(selection.root, item.file_or_symbol);
-        if (files.some(file => pathKey(file.change.path) === pathKey(target))) throw new Error('已提供所选文件内容，无法进一步解析符号。');
-        const content = await contextFile(selection, item.file_or_symbol);
-        if (!contexts.some(file => file.file === content.file)) contexts.push(content);
-      } catch { unresolved.push(item); }
-    }
-    if (contexts.length) {
-      result.coverage.context = contexts.map(item => item.file);
-      if (!await unchanged()) return stale();
-      review = await request();
-      if (!await unchanged()) return stale();
-    }
     result.findings = review.findings;
-    result.context_requests = [...unresolved, ...review.context_requests]
-      .filter((item, index, all) => all.findIndex(other => other.file_or_symbol === item.file_or_symbol) === index).slice(0, 3);
-    result.status = result.context_requests.length || result.coverage.binary.length ? 'incomplete' : result.findings.length ? 'findings' : 'clean';
+    result.status = files.some(item => item.content.binary) ? 'incomplete' : result.findings.length ? 'findings' : 'clean';
     return session;
   } catch (error) {
     result.status = 'error';
