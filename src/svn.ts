@@ -290,6 +290,30 @@ export async function readWorkingContent(target: string): Promise<WorkingContent
   return { text: asText(local.bytes), binary: local.bytes !== undefined && isBinary(local.bytes), symbolicLink: local.symbolicLink };
 }
 
+// Review context uses committed BASE content, never an unselected local edit.
+// Check the target itself: an unchanged external/nested working copy is absent
+// from readChanges(), but still must not become review context.
+export async function readBaseContent(executable: string, folder: string, root: string, target: string): Promise<WorkingContent> {
+  const name = `${path.relative(folder, target)}@`;
+  const info = parse(await run(executable, folder, ['info', '--xml', '--', name])).info?.entry?.[0];
+  const wcRoot = info?.['wc-info']?.['wcroot-abspath'];
+  if (typeof wcRoot !== 'string' || path.normalize(wcRoot) !== path.normalize(root) || info?.['@_kind'] !== 'file') {
+    throw new Error('上下文不是同一工作副本中的文件。');
+  }
+  const status = parse(await run(executable, folder, ['status', '--xml', '--verbose', '--depth', 'empty', '--', name]));
+  const entry = status.status?.target?.flatMap((item: any) => item.entry ?? [])[0];
+  const state = entry?.['wc-status'];
+  if (!state || state['@_file-external'] === 'true' || ['external', 'unversioned', 'added'].includes(state['@_item'])) {
+    throw new Error('上下文没有可用的本工作副本 BASE，或属于 external。');
+  }
+  const properties = await propertyMap(executable, folder, ['proplist', '--xml', '-v', '-r', 'BASE', '--', name]);
+  const bytes = await catBase(executable, folder, path.relative(folder, target));
+  return {
+    text: asText(bytes), binary: (bytes !== undefined && isBinary(bytes)) || isBinaryMime(properties),
+    symbolicLink: properties.has('svn:special')
+  };
+}
+
 async function readContent(executable: string, folder: string, change: Change): Promise<WorkingContent & { base?: string }> {
   const base = await catBase(executable, folder, path.relative(folder, change.path) || '.', change.copiedFrom);
   const bytes = change.item === 'deleted' ? undefined : (await readLocal(change.path)).bytes;

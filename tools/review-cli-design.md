@@ -1,0 +1,44 @@
+# SVN 提交前审查 CLI 设计
+
+状态：用户已确认，2026-10-15。
+
+## 范围与入口
+
+首版只审查 SVN，入口为 `tools/review.cjs`。显式文件参数选择完整文件变更，目录参数展开其下已版本管理的变更；`--all` 明确选择管理范围内全部已版本管理的变更，不包含未跟踪子项。不传选择时显示用法。单次运行一个工作副本，`--scope` 默认为当前目录，不扩大到兄弟目录、externals 或嵌套工作副本。
+
+提交选择固定为本次启动时解析的路径；新增父目录和移动源沿用 `CommitSelection` 的依赖规则，并展示在报告中。整体目录删除合并为完整操作，输入覆盖被删除的子文件。CLI 也允许审查普通删除文件，使用 BASE 内容，包括 `--keep-local` 情况；这不改变插件现有的可提交状态范围。
+
+## 配置与共享核心
+
+入口先读取 `<scope>/.vscode/settings.json`；`--settings` 指定其他 JSON/JSONC 设置文件时替代默认文件，不自动合并用户、工作区、Profile 或 Remote 设置。使用现有 `codeSvn.ai.baseUrl`、`codeSvn.ai.model`、`codeSvn.ai.timeoutSeconds` 和 `codeSvn.svnPath`。密钥由 `CODE_SVN_AI_API_KEY` 环境变量提供，独立 CLI 无法直接读取插件 SecretStorage。
+
+`src/review.ts` 不依赖 VS Code。CLI 通过 `resolveReviewSelection` 解析选择，再调用 `reviewSelection`；后续插件可把自身已解析的选择、有效模型设置、SecretStorage 密钥、提示词和取消信号直接传给核心。共享传输 `requestMessages` 保留 OpenAI 兼容 Chat Completions、非流式返回、超时及取消；草稿仍由 `requestDraft` 构造原提示词。
+
+## 输入与上下文
+
+`tools/review_prompt.md` 是实际运行时读取的提示词。初始输入包含变更类型、路径、复制来源、带 old/new 行号的 diff、属性差异和所选文本内容；删除文件提供编号旧内容，其他所选文件提供编号工作副本内容。没有提供的项目说明、运行环境和检查结果明确记为未知或未执行，修改意图可由 `--intent` 提供。
+
+old 通常为 BASE，复制或移动目标以复制来源修订为基线；new 为本次工作副本版本。二进制只提供元数据并标明内容未分析。每次请求的 system 与 user 总输入最多 60,000 字符；超限停止，不静默截断或拆分总结。
+
+模型最多提出三项 `context_requests`，工具最多自动补充一次，按工作副本根相对路径读取管理范围内未选择文本文件的 BASE。已提供的所选文件不再改用 BASE；符号名、范围外路径、未跟踪、无 BASE、二进制、特殊文件、externals 和嵌套工作副本均不自动读取。未满足请求继续保留，第二次请求仍需要上下文时报告不完整。参见 [ADR 0004](../docs/adr/0004-precommit-review-context.md)。
+
+## 结果与一致性
+
+默认中文终端报告，可用 `--json` 输出单个 JSON 对象。核心校验模型 JSON 的结构、三项上限、严重性、high 置信度、文件范围以及已提供版本的行号。模型仍负责证明问题与本次变更的关联，工具不声称能够机械验证触发链条。
+
+| 退出码 | 状态 | 含义 |
+|---|---|---|
+| 0 | clean | 已提供范围内未发现符合提示词要求的问题 |
+| 1 | findings | 发现问题 |
+| 2 | error | 配置、SVN、服务、响应格式、不支持状态或超限错误 |
+| 3 | incomplete | 仍缺上下文或存在未分析的二进制内容 |
+| 4 | stale | 审查依据已变化 |
+| 130 | error | 用户取消 |
+
+不完整状态优先于发现问题，但保留已发现问题。JSON 包含 `status`、`findings`、`context_requests`、`coverage`、实际模型请求数和可选错误说明。`coverage` 列出工作副本、管理范围、提交选择、依赖、实际输入项、二进制和补充上下文。
+
+请求前后重新读取所选状态、文本及属性，并核对已补充 BASE 内容。变化时结果标为过期。这是前后比较，不能检测两次读取之间修改又恢复的情况，也不提供跨文件原子快照。CLI 只使用磁盘内容，无法获知编辑器未保存缓冲区。
+
+## 运行与验收
+
+Node.js 22+，先 `npm run build`，再 `node tools/review.cjs …`。定向测试使用真实临时 SVN 仓库、可控本地 HTTP 服务和 CLI 子进程，验证输入边界、配置复用、删除/复制/移动/目录属性、JSON/退出码、上下文补充、过期、超时及草稿传输兼容；另运行类型检查。实际远程模型、Windows 环境和后续插件按钮集成需另行验收。

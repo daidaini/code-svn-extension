@@ -302,13 +302,21 @@ function describeNetwork(error: unknown): string {
 export async function requestDraft(
   settings: AiSettings, apiKey: string, items: DraftItem[], signal?: AbortSignal
 ): Promise<string> {
+  return requestMessages(settings, apiKey, buildMessages(items), signal, '草稿');
+}
+
+// Shared transport; callers own their prompt and response validation.
+export async function requestMessages(
+  settings: AiSettings, apiKey: string, messages: { system: string; user: string },
+  signal?: AbortSignal, responseName = '文本'
+): Promise<string> {
   const endpoint = chatEndpoint(settings.baseUrl);
-  const messages = buildMessages(items);
   const controller = new AbortController();
   let cancelled = false;
   let timedOut = false;
   const abort = () => { cancelled = true; controller.abort(); };
   signal?.addEventListener('abort', abort);
+  if (signal?.aborted) abort();
   const timer = setTimeout(() => { timedOut = true; controller.abort(); }, Math.max(1, settings.timeoutSeconds) * 1000);
   try {
     const response = await fetch(endpoint, {
@@ -333,7 +341,7 @@ export async function requestDraft(
       throw new Error('模型服务返回了无法解析的内容（不是 JSON）。');
     }
     const content = (parsed as any)?.choices?.[0]?.message?.content;
-    if (typeof content !== 'string' || !content.trim()) throw new Error('模型服务没有返回草稿内容。');
+    if (typeof content !== 'string' || !content.trim()) throw new Error(`模型服务没有返回${responseName}内容。`);
     return content.trim().replace(/\r\n/g, '\n');
   } catch (error) {
     if (cancelled) throw new AiCancelled();
