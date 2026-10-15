@@ -53,43 +53,20 @@ npm run build
 
 ### 从源码构建 VSIX
 
-以下命令适用于 Linux、WSL 或 macOS 的 shell。在仓库根目录运行；需要 Node.js 22 或更新版本、npm，以及可下载 `@vscode/vsce` 的网络。
+以下命令适用于 Linux、WSL 或 macOS 的 shell；可从任意工作目录调用。需要 Node.js 22 或更新版本、npm，以及可下载 `@vscode/vsce` 的网络。
 
 构建过程先编译 TypeScript，再在临时 staging 目录组装 VSIX 所需文件。仓库的 `.gitignore` 忽略 `dist/`，所以不能直接从仓库根目录打包。staging 目录只放扩展清单、README、编译后的 JavaScript、审查提示词和生产依赖；生产依赖放在 `dist/node_modules`，以便编译文件运行时可以解析。`vsce ls` 会在打包前显示实际文件清单。
 
 ```sh
-set -eu
-repo="$PWD"
-version="$(node -p "require('./package.json').version")"
-
-npm ci
-npm run build
-
-stage="$(mktemp -d)"
-trap 'rm -rf "$stage"' EXIT
-mkdir -p "$stage/dist" "$stage/tools"
-cp package.json package-lock.json README.md "$stage/"
-cp dist/*.js "$stage/dist/"
-cp tools/review_prompt.md "$stage/tools/"
-printf '%s\n' 'package-lock.json' '**/*.map' '**/*.ts' '**/*.vsix' > "$stage/.vscodeignore"
-
-npm ls --omit=dev --all --parseable \
-  | tail -n +2 \
-  | while IFS= read -r dependency; do
-      relative="${dependency#"$repo/node_modules/"}"
-      mkdir -p "$stage/dist/node_modules/$(dirname "$relative")"
-      cp -R "$dependency" "$stage/dist/node_modules/$relative"
-    done
-
-(cd "$stage" && npx --yes --package @vscode/vsce@4.0.0 vsce ls --tree --no-dependencies)
-(cd "$stage" && npx --yes --package @vscode/vsce@4.0.0 vsce package --no-dependencies \
-  --out "$repo/code-svn-extension-$version.vsix")
+./build_version.sh
 ```
+
+脚本会从自身所在目录定位仓库，安装锁定依赖、编译、列出 staging 包内容并生成 VSIX。输出文件位于仓库根目录。
 
 `package.json` 的 `version` 决定输出文件名，例如 `0.1.3` 会生成 `code-svn-extension-0.1.3.vsix`。打包后可检查包内关键文件：
 
 ```sh
-unzip -l "code-svn-extension-$version.vsix" \
+unzip -l "code-svn-extension-$(node -p "require('./package.json').version").vsix" \
   | grep -E 'extension/(dist/(extension|review|review-ui)\.js|tools/review_prompt\.md|dist/node_modules/fast-xml-parser/)'
 ```
 

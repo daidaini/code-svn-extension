@@ -261,8 +261,9 @@ export function textDiff(display: string, before: string, after: string): string
 
 export function buildMessages(items: DraftItem[]): { system: string; user: string } {
   const system = '你是版本管理助手。根据用户提供的一次 SVN 提交的变更说明（含文本差异与属性变化），用中文撰写提交信息草稿：'
-    + '第一行为不超过 50 字的简短标题；确有必要时另起数行，每行以「- 」开头列出变更要点。'
-    + '只输出提交信息本身，不要解释，不要 Markdown 代码块，也不要 Conventional Commits 前缀。';
+    + '优先只输出一行简短标题，标题不超过 50 字，并以以下纯文本类型标记之一开头：[修复]、[需求]、[重构]、[优化]；无法判断时使用[变更]。'
+    + '只有一行无法说明清楚时，才另起数行补充变更要点，每行以「- 」开头。'
+    + '只输出提交信息本身，不要解释，不要 Markdown 格式或代码块。';
   const blocks = items.map(item => `### ${item.heading}\n${item.body}`);
   const user = `本次提交选择共 ${items.length} 项变更，逐项列出相对工作副本根的路径、变更类型，以及属性变化与文本差异。二进制文件只列出路径与变更类型，其内容未提供，不得推测。\n\n${blocks.join('\n\n')}`;
   return { system, user };
