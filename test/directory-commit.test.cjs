@@ -36,7 +36,7 @@ async function deletedTree(f, name = '待删目录') {
   return tree;
 }
 
-test('目录属性可单独审阅并提交，未选子文件保持本地修改', { timeout: 120000 }, async () => {
+test('选择目录会把目录属性和后代变更一起加入并提交', { timeout: 120000 }, async () => {
   const f = await fixture();
   let ui;
   try {
@@ -50,19 +50,44 @@ test('目录属性可单独审阅并提交，未选子文件保持本地修改',
     await eventually(async () => assert.match(await ui.editorText(), /新增属性 reviewed = yes/));
     await ui.chooseChange('SVN：加入待提交', '中文 空格 @目录');
     await eventually(async () => assert.match(await ui.scmText(), /(?:^|\n)待提交(?:\n|$)/));
-    await ui.commitMessage('仅提交目录属性');
+    await eventually(async () => {
+      const text = await ui.scmText();
+      assert.match(text, /待提交/);
+      assert.match(text, /中文 空格 @目录/);
+      assert.match(text, /修改 中文\.txt/);
+    });
+    await ui.chooseChange('SVN：移出待提交', '中文 空格 @目录');
+    await eventually(async () => assert.doesNotMatch(await ui.scmText(), /(?:^|\n)待提交(?:\n|$)/));
+    await ui.chooseChange('SVN：加入待提交', '中文 空格 @目录');
+    await ui.commitMessage('提交目录及其子项');
     await ui.command('SVN：提交待提交文件');
     await eventually(async () => assert.match(await ui.notifications(), /提交成功.*修订/));
+    assert.match(await ui.notifications(), /2 项变更/);
     assert.match(svn(f.root, 'propget', 'reviewed', `${f.url}/中文 空格 @目录@`), /yes/);
-    assert.equal(svn(f.root, 'cat', `${f.url}/中文 空格 @目录/修改 中文.txt@`), 'initial\n');
-    // 子文件的属性变更也未被夹带：仓库中不存在该属性
-    assert.throws(() => svn(f.root, 'propget', 'owner', `${f.url}/中文 空格 @目录/修改 中文.txt@`), /not found/);
-    assert.match(svn(f.scope, 'status', '--xml', '修改 中文.txt'), /item="modified"/);
-    assert.match(svn(f.scope, 'status', '--xml', '修改 中文.txt'), /props="modified"/);
+    assert.equal(svn(f.root, 'cat', `${f.url}/中文 空格 @目录/修改 中文.txt@`), 'initial\n子文件本地修改\n');
+    assert.match(svn(f.root, 'propget', 'owner', `${f.url}/中文 空格 @目录/修改 中文.txt@`), /子文件团队/);
     await eventually(async () => {
       assert.doesNotMatch(await ui.scmText(), /属性已修改/);
-      assert.match(await ui.scmText(), /修改 中文\.txt/);
+      assert.doesNotMatch(await ui.scmText(), /修改 中文\.txt/);
     });
+  } finally {
+    if (ui) await ui.close();
+    await cleanup(f.root);
+  }
+});
+
+test('目录选择遇到未跟踪后代时不留下部分提交选择', { timeout: 120000 }, async () => {
+  const f = await fixture();
+  let ui;
+  try {
+    await fs.writeFile(path.join(f.scope, '修改 中文.txt'), 'LOCAL\n');
+    await fs.writeFile(path.join(f.scope, '未跟踪.txt'), 'UNTRACKED\n');
+    svn(f.scope, 'propset', 'reviewed', 'yes', '.');
+    ui = await host(f.root, f.scope);
+    await ui.command('SVN：刷新变更');
+    await ui.chooseChange('SVN：加入待提交', '中文 空格 @目录');
+    await eventually(async () => assert.match(await ui.notifications(), /尚未跟踪.*先执行添加到版本控制/));
+    assert.doesNotMatch(await ui.scmText(), /(?:^|\n)待提交(?:\n|$)/);
   } finally {
     if (ui) await ui.close();
     await cleanup(f.root);

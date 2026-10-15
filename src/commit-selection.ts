@@ -38,6 +38,10 @@ export class CommitSelection {
   has(target: string): boolean { return this.files.has(pathKey(target)); }
   isDependency(target: string): boolean { return this.dependencies.has(pathKey(target)); }
   remove(target: string): void { this.files.delete(pathKey(target)); this.reconcile([...this.changes.values()]); }
+  removeTree(target: string): void {
+    for (const item of this.files.values()) if (within(target, item)) this.files.delete(pathKey(item));
+    this.reconcile([...this.changes.values()]);
+  }
 
   private parents(target: string): string[] {
     const parents: string[] = [];
@@ -120,14 +124,22 @@ export class CommitSelection {
   }
 
   async add(change: Change, scopes: string[]): Promise<void> {
-    this.checkScope(change.path, scopes);
-    await this.checkFile(change);
-    this.requireMoveSource(change.path);
-    for (const parent of this.parents(change.path)) {
-      this.checkScope(parent, scopes);
-      await this.checkFile(this.changes.get(pathKey(parent))!);
+    await this.addMany([change], scopes);
+  }
+
+  async addMany(changes: Change[], scopes: string[]): Promise<void> {
+    const additions = new Map<string, Change>();
+    for (const change of changes) additions.set(pathKey(change.path), change);
+    for (const change of additions.values()) {
+      this.checkScope(change.path, scopes);
+      await this.checkFile(change);
+      this.requireMoveSource(change.path);
+      for (const parent of this.parents(change.path)) {
+        this.checkScope(parent, scopes);
+        await this.checkFile(this.changes.get(pathKey(parent))!);
+      }
     }
-    this.files.set(pathKey(change.path), change.path);
+    for (const change of additions.values()) this.files.set(pathKey(change.path), change.path);
     this.reconcile([...this.changes.values()]);
   }
 

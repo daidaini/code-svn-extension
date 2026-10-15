@@ -191,7 +191,7 @@ export function activate(context: vscode.ExtensionContext): void {
       });
       const choice = resource?.resourceUri
         ? choices.find(item => pathKey(item.target) === pathKey(resource.resourceUri.fsPath))
-        : await vscode.window.showQuickPick(choices, { placeHolder: remove ? '选择要移出待提交的文件' : '选择要加入待提交的完整文件' });
+        : await vscode.window.showQuickPick(choices, { placeHolder: remove ? '选择要移出待提交的文件或目录' : '选择要加入待提交的文件或目录' });
       if (!choice) {
         // Excluded items are not choices: a resource-row click on one must
         // guide to the operation that owns it instead of failing silently or
@@ -225,11 +225,24 @@ export function activate(context: vscode.ExtensionContext): void {
         await reviewRun.done;
       }
       if (writes.isBusy(key)) throw new Error('该工作副本正在执行写操作，请等待完成。');
-      if (remove) choice.view.selected.remove(choice.target);
+      if (remove) {
+        const change = choice.view.changes.find(change => pathKey(change.path) === pathKey(choice.target));
+        if (change && (change.kind === 'dir'
+          || (change.item !== 'deleted' && (await fs.lstat(change.path)).isDirectory()))) {
+          choice.view.selected.removeTree(choice.target);
+        }
+        else choice.view.selected.remove(choice.target);
+      }
       else {
         const change = choice.view.changes.find(change => pathKey(change.path) === pathKey(choice.target));
         if (!change) throw new Error('变更状态或管理范围已变化，请刷新后重新选择。');
-        await choice.view.selected.add(change, openedFolders().map(folder => folder.uri.fsPath));
+        const isDirectory = change.kind === 'dir'
+          || (change.item !== 'deleted' && (await fs.lstat(change.path)).isDirectory());
+        const changes = isDirectory && change.item !== 'deleted'
+          ? choice.view.changes.filter(item => within(change.path, item.path)
+            && !(item.item === 'deleted' && (deletedTreeRoot(item.path, choice.view.changes) || item.movedTo)))
+          : [change];
+        await choice.view.selected.addMany(changes, openedFolders().map(folder => folder.uri.fsPath));
       }
       showChanges(choice.view, choice.view.changes);
       reassessDrafts();
