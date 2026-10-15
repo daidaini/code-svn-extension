@@ -26,6 +26,9 @@
       { "command": "codeSvn.unselect", "title": "SVN：移出待提交", "icon": "$(remove)" },
       { "command": "codeSvn.commit", "title": "SVN：提交待提交文件", "icon": "$(check)" },
       { "command": "codeSvn.generateDraft", "title": "SVN：生成提交信息草稿", "icon": "$(sparkle)" },
+      { "command": "codeSvn.review", "title": "SVN：审查待提交", "icon": "$(sparkle)" },
+      { "command": "codeSvn.reviewAndCommit", "title": "SVN：审查并提交", "icon": "$(check-all)" },
+      { "command": "codeSvn.showReviewResults", "title": "SVN：查看审查结果" },
       { "command": "codeSvn.setApiKey", "title": "SVN：配置 AI API Key" },
       { "command": "codeSvn.history", "title": "SVN：查看历史" }
     ],
@@ -34,7 +37,9 @@
         { "command": "codeSvn.refresh", "when": "scmProvider == codeSvn", "group": "navigation" },
         { "command": "codeSvn.update", "when": "scmProvider == codeSvn", "group": "navigation" },
         { "command": "codeSvn.commit", "when": "scmProvider == codeSvn", "group": "navigation" },
-        { "command": "codeSvn.generateDraft", "when": "scmProvider == codeSvn", "group": "navigation" }
+        { "command": "codeSvn.generateDraft", "when": "scmProvider == codeSvn", "group": "navigation" },
+        { "command": "codeSvn.review", "when": "scmProvider == codeSvn", "group": "navigation" },
+        { "command": "codeSvn.reviewAndCommit", "when": "scmProvider == codeSvn", "group": "navigation" }
       ],
       "scm/resourceState/context": [
         { "command": "codeSvn.add", "when": "scmProvider == codeSvn && scmResourceGroup == 未跟踪", "group": "inline" },
@@ -46,6 +51,9 @@
       "explorer/context": [
         { "command": "codeSvn.history", "when": "resourceScheme == file", "group": "7_svn" }
       ]
+    },
+    "views": {
+      "scm": [ { "id": "codeSvn.reviewResults", "name": "SVN 审查结果" } ]
     },
     "configuration": {
       "title": "Code SVN",

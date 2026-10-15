@@ -1,5 +1,8 @@
 import * as vscode from 'vscode';
 import * as path from 'node:path';
+import * as fs from 'node:fs/promises';
+import { watch } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { CommitSelection, WorkingCopyWrites, deletedTreeRoot, pathKey, within } from './commit-selection';
 import {
   AiCancelled, DraftInput, AiSettings, apiKeySecret, assertInputWithinLimit, collectDraftInput, draftBasis, configurationProblems, requestDraft
@@ -9,6 +12,8 @@ import {
   readChanges, readDifference, readHistoryBatch, readObjectLocation, readRevisionDifference, readRevisionPaths, readWorkingContent,
   revertChanges, updateScopes, WorkingCopyQueryError
 } from './svn';
+import { ReviewSelection, runReview } from './review';
+import { ReviewEntry, ReviewResults } from './review-ui';
 
 // Local and base content reach the diff editor through this scheme so a deleted
 // side, a directory and an added item all have something honest to show.
@@ -142,6 +147,9 @@ export function activate(context: vscode.ExtensionContext): void {
   const documentChanges = new vscode.EventEmitter<vscode.Uri>();
   const writes = new WorkingCopyWrites();
   const drafts = new Map<string, AbortController>();
+  const reviewEntries = new Map<string, ReviewEntry>();
+  const reviewRuns = new Map<string, { controller: AbortController; done: Promise<void>; finish: () => void; invalidReason?: string }>();
+  let nextReviewId = 1;
   // The input a filled draft was generated from, per working copy. `stale` makes the warning
   // fire only on the transition; `queue` serialises checks.
   interface DraftRecord { basis: string; stale: boolean; queue: Promise<unknown> }
@@ -160,9 +168,8 @@ export function activate(context: vscode.ExtensionContext): void {
     return vscode.workspace.getConfiguration('codeSvn', folder.uri).get<string>('svnPath', 'svn');
   }
 
-  function aiSettings(scopePath: string): AiSettings {
-    const folder = openedFolders().find(candidate => within(candidate.uri.fsPath, scopePath));
-    const config = vscode.workspace.getConfiguration('codeSvn', folder?.uri ?? null);
+  function aiSettings(): AiSettings {
+    const config = vscode.workspace.getConfiguration('codeSvn');
     return {
       baseUrl: config.get<string>('ai.baseUrl', ''),
       model: config.get<string>('ai.model', ''),
@@ -211,6 +218,12 @@ export function activate(context: vscode.ExtensionContext): void {
       }
       const key = pathKey(choice.view.scm.rootUri!.fsPath);
       if (views.get(key) !== choice.view) throw new Error('工作副本或管理范围已变化，请重新选择。');
+      const reviewRun = reviewRuns.get(key);
+      if (reviewRun) {
+        reviewRun.invalidReason = '提交选择已变化。';
+        reviewRun.controller.abort();
+        await reviewRun.done;
+      }
       if (writes.isBusy(key)) throw new Error('该工作副本正在执行写操作，请等待完成。');
       if (remove) choice.view.selected.remove(choice.target);
       else {
@@ -442,7 +455,204 @@ export function activate(context: vscode.ExtensionContext): void {
     draftDebounce = setTimeout(reassessDrafts, 300);
   }
 
-  async function commit(sourceControl?: vscode.SourceControl): Promise<void> {
+  async function reviewSelectionFor(key: string, view: WorkingCopyView): Promise<ReviewSelection> {
+    const scopes = openedFolders().filter(folder => pathKey(knownRoots.get(folder.uri.toString()) ?? '') === key)
+      .map(folder => folder.uri.fsPath);
+    if (!scopes.length) throw new Error('工作副本已不在当前打开的管理范围内。');
+    const folders = openedFolders().filter(folder => scopes.some(scope => pathKey(scope) === pathKey(folder.uri.fsPath)));
+    const executables = [...new Set(folders.map(svnExecutable))];
+    if (executables.length !== 1) throw new Error('同一工作副本的打开目录配置了不同 SVN 可执行文件，请统一 codeSvn.svnPath 后重试。');
+    const targets = view.selected.targets;
+    return {
+      executable: executables[0], scopes, root: view.scm.rootUri!.fsPath,
+      explicit: view.selected.explicitTargets,
+      targets,
+      dependencies: targets.filter(target => view.selected.isDependency(target))
+    };
+  }
+
+  function reviewFingerprint(settings: AiSettings, apiKey: string, prompt: string): string {
+    return createHash('sha256').update(JSON.stringify({ settings, apiKey, prompt })).digest('hex');
+  }
+
+  async function reviewConfigurationMatches(entry: ReviewEntry): Promise<boolean> {
+    if (!entry.configurationFingerprint) return false;
+    try {
+      const prompt = await fs.readFile(path.join(context.extensionPath, 'tools', 'review_prompt.md'), 'utf8');
+      const apiKey = (await context.secrets.get(apiKeySecret))?.trim() ?? '';
+      return reviewFingerprint(aiSettings(), apiKey, prompt) === entry.configurationFingerprint;
+    } catch { return false; }
+  }
+
+  async function review(sourceControl?: vscode.SourceControl, commitAfter = false): Promise<void> {
+    const candidates = [...views.entries()];
+    const candidate = sourceControl ? candidates.find(([, view]) => view.scm === sourceControl)
+      : candidates.length === 1 ? candidates[0]
+        : await vscode.window.showQuickPick(candidates.map(([key, view]) => ({
+          label: view.scm.rootUri!.fsPath, description: `${view.selected.size} 项待审查`, key, view
+        })), { placeHolder: '选择要审查的工作副本' });
+    if (!candidate) return;
+    const [key, view] = Array.isArray(candidate) ? candidate : [candidate.key, candidate.view];
+    const activeReview = reviewRuns.get(key);
+    if (activeReview) {
+      const action = await vscode.window.showWarningMessage('该工作副本正在审查；可等待完成，或取消当前审查。', '取消当前审查');
+      if (action === '取消当前审查') activeReview.controller.abort();
+      return;
+    }
+    if (drafts.has(key)) {
+      void vscode.window.showWarningMessage('该工作副本正在生成 AI 草稿，请等待或取消草稿后重试；不会重复请求。');
+      return;
+    }
+    const targets = view.selected.targets;
+    if (!targets.length) { void vscode.window.showWarningMessage('没有待提交文件，请先加入待提交。'); return; }
+    const commitMessage = view.scm.inputBox.value;
+    const intent = commitMessage.trim();
+    if (commitAfter && !intent) { void vscode.window.showWarningMessage('审查并提交需要先填写提交信息。'); return; }
+    let selection: ReviewSelection;
+    try {
+      await refresh();
+      if (views.get(key) !== view || view.lastError) throw new Error('无法确认工作副本当前状态，请刷新并检查查询日志。');
+      selection = await reviewSelectionFor(key, view);
+      await view.selected.validate(targets, [...view.ancestors, ...view.changes], selection.scopes);
+    } catch (error) {
+      void vscode.window.showErrorMessage(error instanceof Error ? error.message : String(error)); return;
+    }
+    const dirty = () => vscode.workspace.textDocuments.filter(document => document.uri.scheme === 'file'
+      && document.isDirty && targets.some(target => pathKey(target) === pathKey(document.uri.fsPath)));
+    try {
+      if (dirty().length) {
+        const action = await vscode.window.showWarningMessage('选中文件有未保存内容。保存后再审查？', { modal: true }, '保存并审查');
+        if (action !== '保存并审查') return;
+        for (const document of dirty()) if (!await document.save()) throw new Error(`无法保存 ${document.uri.fsPath}，审查已停止。`);
+        await refresh();
+        if (views.get(key) !== view || view.lastError) throw new Error('保存后无法确认工作副本状态，审查已停止。');
+        selection = await reviewSelectionFor(key, view);
+        await view.selected.validate(targets, [...view.ancestors, ...view.changes], selection.scopes);
+        if (dirty().length) throw new Error('选中文件仍有未保存内容，审查已停止。');
+      }
+    } catch (error) {
+      void vscode.window.showErrorMessage(error instanceof Error ? error.message : String(error)); return;
+    }
+    const settings = aiSettings();
+    const apiKey = (await context.secrets.get(apiKeySecret))?.trim() ?? '';
+    const problems = configurationProblems(settings, apiKey);
+    if (problems.length) { void vscode.window.showErrorMessage(`AI 配置不完整：${problems.join('；')}；未发送请求。`); return; }
+    const promptPath = path.join(context.extensionPath, 'tools', 'review_prompt.md');
+    let prompt: string;
+    try { prompt = await fs.readFile(promptPath, 'utf8'); }
+    catch { void vscode.window.showErrorMessage('找不到扩展内的 tools/review_prompt.md；未发送请求。'); return; }
+    const promptHash = createHash('sha256').update(prompt).digest('hex');
+    const fingerprint = reviewFingerprint(settings, apiKey, prompt);
+    if (writes.isBusy(key)) { void vscode.window.showWarningMessage('该工作副本正在执行写操作，请等待完成。'); return; }
+    const release = writes.tryAcquire(key);
+    if (!release) return;
+    try {
+      await refresh();
+      if (views.get(key) !== view || view.lastError) throw new Error('无法确认工作副本当前状态，请刷新并检查查询日志。');
+      const current = await reviewSelectionFor(key, view);
+      await view.selected.validate(targets, [...view.ancestors, ...view.changes], current.scopes);
+      const currentPrompt = await fs.readFile(promptPath, 'utf8');
+      const currentApiKey = (await context.secrets.get(apiKeySecret))?.trim() ?? '';
+      if (JSON.stringify(current) !== JSON.stringify(selection) || dirty().length
+        || view.scm.inputBox.value !== commitMessage
+        || reviewFingerprint(aiSettings(), currentApiKey, currentPrompt) !== fingerprint) {
+        throw new Error('审查准备期间提交选择、管理范围或选定文件内容已变化，请重新开始审查。');
+      }
+    } catch (error) {
+      release();
+      void vscode.window.showErrorMessage(error instanceof Error ? error.message : String(error)); return;
+    }
+    const controller = new AbortController();
+    let finish!: () => void;
+    const done = new Promise<void>(resolve => { finish = resolve; });
+    reviewRuns.set(key, { controller, done, finish });
+    for (const old of reviewEntries.values()) if (old.key === key) old.status = 'replaced';
+    const entry: ReviewEntry = {
+      id: nextReviewId++, key, root: view.scm.rootUri!.fsPath, status: 'running',
+      model: settings.model, commitMessage, intent, configurationFingerprint: fingerprint
+    };
+    reviewEntries.set(key, entry); reviewUI.refresh(entry);
+    try {
+      const session = await vscode.window.withProgress({
+        location: vscode.ProgressLocation.Notification, title: '正在审查 SVN 待提交内容…', cancellable: true
+      }, (_progress, token) => {
+        token.onCancellationRequested(() => controller.abort());
+        return runReview({ selection, settings, apiKey, prompt, intent }, controller.signal);
+      });
+      entry.session = session; entry.result = session.result; entry.status = session.result.status;
+      const currentSelection = await reviewSelectionFor(key, view).catch(() => undefined);
+      if (controller.signal.aborted) {
+        const reason = reviewRuns.get(key)?.invalidReason;
+        entry.status = reason ? 'stale' : 'cancelled';
+        if (reason) entry.staleReason = reason;
+      }
+      else if (['clean', 'findings', 'incomplete'].includes(entry.status)
+        && (views.get(key) !== view || view.lastError || view.scm.inputBox.value !== commitMessage
+        || unsavedTargets(targets) || !currentSelection || !await session.isCurrent(currentSelection)
+        || reviewFingerprint(aiSettings(), (await context.secrets.get(apiKeySecret))?.trim() ?? '', prompt) !== fingerprint
+        || createHash('sha256').update(await fs.readFile(promptPath, 'utf8').catch(() => '')).digest('hex') !== promptHash)) {
+        entry.status = 'stale'; entry.staleReason = '提交选择、内容、提交信息、管理范围或审查提示词已变化。';
+      }
+    } catch (error) {
+      const reason = reviewRuns.get(key)?.invalidReason;
+      entry.status = reason ? 'stale' : controller.signal.aborted ? 'cancelled' : 'error';
+      if (reason) entry.staleReason = reason;
+      entry.result = { status: 'error', findings: [], context_requests: [], requests: 0,
+        coverage: { root: entry.root, scope: selection.scopes[0], scopes: selection.scopes, selected: [], dependencies: [], files: [], binary: [], context: [] },
+        error: error instanceof Error ? error.message : String(error) };
+    } finally {
+      reviewRuns.delete(key); release(); finish();
+    }
+    if (disposed) return;
+    reviewUI.refresh(entry);
+    await reviewUI.show(entry);
+    if (disposed) return;
+    if (entry.status === 'cancelled') { void vscode.window.showInformationMessage('审查已取消；没有执行提交。'); return; }
+    if (entry.status === 'clean') void vscode.window.showInformationMessage('已提供范围内未发现符合要求的问题。');
+    else if (entry.status === 'findings') void vscode.window.showWarningMessage(`审查发现 ${entry.result?.findings.length ?? 0} 个问题，请查看审查结果。`);
+    else if (entry.status === 'incomplete') void vscode.window.showWarningMessage('审查不完整，请查看审查结果。');
+    else if (entry.status === 'stale') void vscode.window.showWarningMessage('审查依据已变化，结果已过期；请重新审查。');
+    else if (entry.status === 'error') void vscode.window.showErrorMessage(`审查失败：${entry.result?.error ?? '未知错误'}`);
+    if (!commitAfter) return;
+    if (entry.status !== 'clean' && entry.status !== 'findings' && entry.status !== 'incomplete') {
+      void vscode.window.showWarningMessage('审查未产生可确认的有效结果，请查看审查报告并重新审查。'); return;
+    }
+    await confirmReviewCommit(key, entry.id);
+  }
+
+  const reviewUI = new ReviewResults(
+    () => reviewEntries.values(),
+    key => { const view = views.get(key); if (view) void review(view.scm); },
+    (key, id) => { const entry = reviewEntries.get(key); if (entry?.id === id) void confirmReviewCommit(key, id); }
+  );
+
+  async function confirmReviewCommit(key: string, id: number): Promise<void> {
+    const entry = reviewEntries.get(key);
+    const view = views.get(key);
+    if (!entry || entry.id !== id || !view || !entry.session
+      || !['clean', 'findings', 'incomplete'].includes(entry.status)) return;
+    const action = entry.status === 'clean'
+      ? await vscode.window.showWarningMessage('审查未发现符合要求的问题。确认提交本次选择？', { modal: true }, '确认提交')
+      : await vscode.window.showWarningMessage(entry.status === 'findings'
+        ? `审查发现 ${entry.result?.findings.length ?? 0} 个问题。仍要提交吗？`
+        : `审查不完整${entry.result?.findings.length ? `，并发现 ${entry.result.findings.length} 个问题` : ''}。仍要提交吗？`,
+      { modal: true }, entry.status === 'findings' ? '仍然提交（有审查问题）' : '仍然提交（审查未完成）');
+    if ((entry.status === 'clean' && action === '确认提交')
+      || (entry.status === 'findings' && action === '仍然提交（有审查问题）')
+      || (entry.status === 'incomplete' && action === '仍然提交（审查未完成）')) await commit(view.scm, entry);
+  }
+
+  function invalidateCompletedReviews(reason: string): void {
+    for (const run of reviewRuns.values()) { run.invalidReason = reason; run.controller.abort(); }
+    for (const entry of reviewEntries.values()) {
+      if (entry.status === 'running') { entry.staleReason = reason; continue; }
+      if (!['clean', 'findings', 'incomplete'].includes(entry.status)) continue;
+      entry.status = 'stale'; entry.staleReason = reason;
+      reviewUI.refresh(entry);
+    }
+  }
+
+  async function commit(sourceControl?: vscode.SourceControl, reviewed?: ReviewEntry): Promise<void> {
     const candidates = [...views.entries()];
     const candidate = sourceControl ? candidates.find(([, view]) => view.scm === sourceControl)
       : candidates.length === 1 ? candidates[0]
@@ -468,6 +678,16 @@ export function activate(context: vscode.ExtensionContext): void {
         await view.selected.validate(targets, [...view.ancestors, ...view.changes], openedFolders().map(folder => folder.uri.fsPath));
       };
       await validate();
+      if (reviewed) {
+        const current = reviewEntries.get(key);
+        if (current !== reviewed || !['clean', 'findings', 'incomplete'].includes(reviewed.status) || !reviewed.session
+          || view.scm.inputBox.value !== reviewed.commitMessage
+          || !await reviewConfigurationMatches(reviewed)) {
+          reviewed.status = 'stale'; reviewed.staleReason = '审查结果、提交选择或提交信息已变化。';
+          reviewUI.refresh(reviewed);
+          throw new Error('审查依据已变化，请重新审查后再提交。');
+        }
+      }
       const dirty = () => vscode.workspace.textDocuments.filter(document => document.uri.scheme === 'file'
         && document.isDirty && targets.some(target => pathKey(target) === pathKey(document.uri.fsPath)));
       if (dirty().length > 0) {
@@ -482,6 +702,19 @@ export function activate(context: vscode.ExtensionContext): void {
           { modal: true }, '仍然提交过期草稿');
         if (action !== '仍然提交过期草稿') return;
       }
+      if (reviewed) {
+        await validate();
+        const selection = await reviewSelectionFor(key, view);
+        if (!['clean', 'findings', 'incomplete'].includes(reviewed.status)
+          || view.scm.inputBox.value !== reviewed.commitMessage
+          || unsavedTargets(targets) || reviewEntries.get(key) !== reviewed
+          || !reviewed.session || !await reviewed.session.isCurrent(selection)
+          || !await reviewConfigurationMatches(reviewed)) {
+          reviewed.status = 'stale'; reviewed.staleReason = '最终确认时提交选择、内容或管理范围已变化。';
+          reviewUI.refresh(reviewed);
+          throw new Error('审查依据已变化，请重新审查后再提交。');
+        }
+      }
       const folder = openedFolders().find(folder => within(folder.uri.fsPath, targets[0]))!;
       const revision = await commitFiles(svnExecutable(folder), view.scm.rootUri!.fsPath, targets, message);
       await refresh();
@@ -489,6 +722,7 @@ export function activate(context: vscode.ExtensionContext): void {
       view.selected.complete(targets);
       filledDrafts.delete(key);
       if (view.scm.inputBox.value === message) view.scm.inputBox.value = '';
+      if (reviewed) { reviewed.status = 'used'; reviewed.staleReason = undefined; reviewUI.refresh(reviewed); }
       showChanges(view, view.changes);
       void vscode.window.showInformationMessage(`SVN 提交成功：修订 ${revision}，${targets.length} 项变更（含必需提交依赖）。`);
     } catch (error) {
@@ -511,10 +745,12 @@ export function activate(context: vscode.ExtensionContext): void {
     if (value === undefined) return;
     if (!value.trim()) {
       await context.secrets.delete(apiKeySecret);
+      invalidateCompletedReviews('AI API Key 已变化。');
       void vscode.window.showInformationMessage('已清除保存的 API Key。');
       return;
     }
     await context.secrets.store(apiKeySecret, value.trim());
+    invalidateCompletedReviews('AI API Key 已变化。');
     void vscode.window.showInformationMessage('API Key 已保存到 VS Code SecretStorage。');
   }
 
@@ -530,8 +766,8 @@ export function activate(context: vscode.ExtensionContext): void {
         })), { placeHolder: '选择要为哪个工作副本生成提交信息草稿' }));
     if (!candidate) return;
     const [key, view] = Array.isArray(candidate) ? candidate : [candidate.key, candidate.view];
-    if (drafts.has(key)) {
-      void vscode.window.showWarningMessage('该工作副本正在生成提交信息草稿，请等待完成或取消；不会重复请求。');
+    if (drafts.has(key) || reviewRuns.has(key) || writes.isBusy(key)) {
+      void vscode.window.showWarningMessage('该工作副本正在执行审查、草稿生成或写操作，请等待完成或取消后重试。');
       return;
     }
     const targets = view.selected.targets;
@@ -539,7 +775,7 @@ export function activate(context: vscode.ExtensionContext): void {
       void vscode.window.showWarningMessage('没有待提交文件，请先加入待提交；生成与提交使用同一份提交选择。');
       return;
     }
-    const settings = aiSettings(targets[0]);
+    const settings = aiSettings();
     const apiKey = (await context.secrets.get(apiKeySecret))?.trim() ?? '';
     const problems = configurationProblems(settings, apiKey);
     if (problems.length > 0) {
@@ -562,6 +798,12 @@ export function activate(context: vscode.ExtensionContext): void {
       await view.selected.validate(current, changed(), scopes);
     };
     const collect = (): Promise<DraftInput> => collectDraftInput(executable, scopes, root, changed(), targets);
+    if (drafts.has(key) || reviewRuns.has(key) || writes.isBusy(key)) {
+      void vscode.window.showWarningMessage('该工作副本正在执行审查、草稿生成或写操作，请等待完成或取消后重试。');
+      return;
+    }
+    const release = writes.tryAcquire(key);
+    if (!release) return;
     const controller = new AbortController();
     drafts.set(key, controller);
     try {
@@ -634,6 +876,7 @@ export function activate(context: vscode.ExtensionContext): void {
         .then(action => { if (action === '查看日志') output.show(); });
     } finally {
       drafts.delete(key);
+      release();
     }
   }
 
@@ -906,14 +1149,19 @@ export function activate(context: vscode.ExtensionContext): void {
     });
     knownRoots = nextRoots;
     for (const [key, view] of views) {
-      if (!copies.has(key)) { view.scm.dispose(); views.delete(key); }
+      if (!copies.has(key)) {
+        const active = reviewRuns.get(key);
+        if (active) { active.invalidReason = '工作副本已关闭。'; active.controller.abort(); }
+        view.scm.dispose(); views.delete(key);
+      }
     }
     for (const [key, copy] of copies) {
       if (!views.has(key)) {
         const scm = vscode.scm.createSourceControl('codeSvn', 'SVN', vscode.Uri.file(copy.root));
         scm.inputBox.visible = true;
         scm.acceptInputCommand = { command: 'codeSvn.commit', title: '提交待提交文件', arguments: [scm] };
-        views.set(key, { scm, groups: new Map(), changes: [], ancestors: [], lastError: '', selected: new CommitSelection(copy.root) });
+        const view: WorkingCopyView = { scm, groups: new Map(), changes: [], ancestors: [], lastError: '', selected: new CommitSelection(copy.root) };
+        views.set(key, view);
       }
       const view = views.get(key)!;
       if (copy.errors.length === 0) {
@@ -970,10 +1218,40 @@ export function activate(context: vscode.ExtensionContext): void {
     debounce = setTimeout(() => { void refresh(); }, 300);
   }
 
+  async function showReviewResults(sourceControl?: vscode.SourceControl): Promise<void> {
+    const entries = [...reviewEntries.values()];
+    const entry = sourceControl
+      ? entries.find(item => views.get(item.key)?.scm === sourceControl)
+      : entries.length === 1 ? entries[0]
+        : await vscode.window.showQuickPick(entries.map(item => ({ label: item.root, description: item.status, entry: item })),
+          { placeHolder: '选择要查看的审查结果' }).then(choice => choice?.entry);
+    if (entry) await reviewUI.show(entry);
+    else void vscode.window.showInformationMessage('当前没有审查结果。');
+  }
+
   // Poll as a fallback for external CLI operations and ignored .svn metadata.
   const poll = setInterval(() => { void refresh(); }, 5000);
+  const reviewMessagePoll = setInterval(() => {
+    for (const entry of reviewEntries.values()) {
+      const view = views.get(entry.key);
+      if (!view || view.scm.inputBox.value === entry.commitMessage) continue;
+      const active = reviewRuns.get(entry.key);
+      if (active) { active.invalidReason = '提交信息已变化。'; active.controller.abort(); }
+      if (['clean', 'findings', 'incomplete'].includes(entry.status)) {
+        entry.status = 'stale'; entry.staleReason = '提交信息已变化。'; reviewUI.refresh(entry);
+      }
+    }
+  }, 250);
+  let promptWatcher: ReturnType<typeof watch> | undefined;
+  try {
+    promptWatcher = watch(path.join(context.extensionPath, 'tools'), (_event, filename) => {
+      if (!filename || filename.toString() === 'review_prompt.md') invalidateCompletedReviews('审查提示词已变化。');
+    });
+  } catch { /* Some remote extension filesystems do not support watching the installation directory. */ }
   context.subscriptions.push(
     output,
+    reviewUI,
+    vscode.workspace.registerTextDocumentContentProvider('codeSvnReview', reviewUI),
     documentChanges,
     vscode.commands.registerCommand('codeSvn.refresh', refresh),
     vscode.commands.registerCommand('codeSvn.showOutput', () => output.show()),
@@ -984,6 +1262,10 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('codeSvn.update', update),
     vscode.commands.registerCommand('codeSvn.commit', commit),
     vscode.commands.registerCommand('codeSvn.generateDraft', (sourceControl?: vscode.SourceControl) => generate(sourceControl)),
+    vscode.commands.registerCommand('codeSvn.review', (sourceControl?: vscode.SourceControl) => review(sourceControl)),
+    vscode.commands.registerCommand('codeSvn.reviewAndCommit', (sourceControl?: vscode.SourceControl) => review(sourceControl, true)),
+    vscode.commands.registerCommand('codeSvn.showReviewResults', (sourceControl?: vscode.SourceControl) => showReviewResults(sourceControl)),
+    vscode.commands.registerCommand('codeSvn.reviewActivate', (node: Parameters<ReviewResults['activate']>[0]) => reviewUI.activate(node)),
     vscode.commands.registerCommand('codeSvn.setApiKey', configureApiKey),
     vscode.commands.registerCommand('codeSvn.viewChange', (change: Change) => viewChange(change)),
     vscode.commands.registerCommand('codeSvn.history', (resource?: vscode.Uri | vscode.SourceControlResourceState) => history(resource)),
@@ -1000,13 +1282,34 @@ export function activate(context: vscode.ExtensionContext): void {
       }
     }),
     vscode.workspace.onDidCloseTextDocument(document => { documents.delete(document.uri.toString()); }),
-    vscode.workspace.onDidChangeTextDocument(event => { if (filledDrafts.size > 0 && isSelectedFile(event.document.uri)) scheduleDraftCheck(); }),
-    vscode.workspace.onDidChangeWorkspaceFolders(() => { void refresh(); }),
+    vscode.workspace.onDidChangeTextDocument(event => {
+      if (!isSelectedFile(event.document.uri)) return;
+      if (filledDrafts.size > 0) scheduleDraftCheck();
+      for (const [key, view] of views) {
+        if (!view.selected.targets.some(target => pathKey(target) === pathKey(event.document.uri.fsPath))) continue;
+        const active = reviewRuns.get(key);
+        if (active) { active.invalidReason = '选中文件的编辑器内容已变化。'; active.controller.abort(); }
+        const entry = reviewEntries.get(key);
+        if (entry && ['clean', 'findings', 'incomplete'].includes(entry.status)) {
+          entry.status = 'stale'; entry.staleReason = '选中文件的编辑器内容已变化。'; reviewUI.refresh(entry);
+        }
+      }
+    }),
+    vscode.workspace.onDidChangeWorkspaceFolders(() => {
+      invalidateCompletedReviews('工作区管理范围已变化。');
+      void refresh();
+    }),
     vscode.workspace.onDidChangeConfiguration(event => {
-      if (event.affectsConfiguration('codeSvn.svnPath')) void refresh();
+      if (event.affectsConfiguration('codeSvn.svnPath')) {
+        invalidateCompletedReviews('SVN 可执行配置已变化。');
+        void refresh();
+      }
+      if (event.affectsConfiguration('codeSvn.ai')) invalidateCompletedReviews('AI 服务配置已变化。');
     }),
     { dispose() {
-      disposed = true; clearInterval(poll); if (debounce) clearTimeout(debounce); if (draftDebounce) clearTimeout(draftDebounce);
+      disposed = true; clearInterval(poll); clearInterval(reviewMessagePoll); if (debounce) clearTimeout(debounce); if (draftDebounce) clearTimeout(draftDebounce);
+      promptWatcher?.close();
+      for (const run of reviewRuns.values()) run.controller.abort();
       for (const watcher of watchers.values()) watcher.dispose();
       for (const view of views.values()) view.scm.dispose();
     } }

@@ -316,3 +316,31 @@ test('配置错误及超时明确失败，共享传输仍支持提交信息草�
   assert.equal(draft, '草稿内容');
   assert.match(f.requests.at(-1).payload.messages[0].content, /提交信息草稿/);
 });
+
+test('审查会话支持同一工作副本的多个打开目录，返回后重验并保留问题快照', async t => {
+  const f = await fixture(t, () => ({ findings: [finding], context_requests: [] }));
+  await f.edit();
+  const other = path.join(f.wc, 'sibling');
+  await fs.writeFile(path.join(other, 'outside.js'), 'SECOND_SELECTED_CHANGE\n');
+  const selection = {
+    executable: process.env.SVN_EXECUTABLE || 'svn', root: f.wc, scopes: [f.scope, other],
+    explicit: [path.join(f.scope, 'main.js'), path.join(other, 'outside.js')],
+    targets: [path.join(other, 'outside.js'), path.join(f.scope, 'main.js')], dependencies: []
+  };
+  const { runReview } = require('../dist/review.js');
+  const session = await runReview({ selection,
+    settings: { baseUrl: f.settings['codeSvn.ai.baseUrl'], model: 'review-fixture', timeoutSeconds: 10 }, apiKey,
+    prompt: await fs.readFile(path.resolve('tools/review_prompt.md'), 'utf8') });
+  assert.equal(session.result.status, 'findings', JSON.stringify(session.result));
+  assert.match(f.requests[0].payload.messages[1].content, /SECOND_SELECTED_CHANGE/);
+  assert.equal(await session.isCurrent(selection), true);
+  assert.equal(await session.isCurrent({ ...selection, scopes: [f.wc] }), false);
+  const snapshot = session.snapshot(session.result.findings[0]);
+  assert.equal(snapshot.lineStart, 2);
+  assert.match(snapshot.text, /return value - 1/);
+  await f.edit('helper.js', 'UNSELECTED_LOCAL_CHANGE\n');
+  assert.equal(await session.isCurrent(selection), true);
+  await f.edit('main.js', 'AFTER_REVIEW\n');
+  assert.equal(await session.isCurrent(selection), false);
+  assert.match(session.snapshot(session.result.findings[0]).text, /return value - 1/);
+});

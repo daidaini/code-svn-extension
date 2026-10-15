@@ -6,11 +6,35 @@ import { Change, ChangeContent, changeLabel, readBaseContent, readChanges, readD
 
 export interface ReviewSelection {
   executable: string;
-  scope: string;
+  scopes: string[];
   root: string;
   explicit: string[];
   targets: string[];
   dependencies: string[];
+}
+
+type SelectionInput = ReviewSelection | (Omit<ReviewSelection, 'scopes'> & { scope: string });
+
+export interface ReviewInput {
+  selection: ReviewSelection;
+  settings: AiSettings;
+  apiKey: string;
+  prompt: string;
+  intent?: string;
+}
+
+export interface ReviewLocation {
+  file: string;
+  side: 'old' | 'new';
+  text: string;
+  lineStart: number;
+  lineEnd: number;
+}
+
+export interface ReviewSession {
+  readonly result: ReviewResult;
+  isCurrent(selection: ReviewSelection): Promise<boolean>;
+  snapshot(finding: ReviewFinding): ReviewLocation;
 }
 
 export interface ReviewFinding {
@@ -36,7 +60,7 @@ export interface ReviewResult extends ModelReview {
   status: 'clean' | 'findings' | 'incomplete' | 'stale' | 'error';
   requests: number;
   coverage: {
-    root: string; scope: string; selected: string[]; dependencies: string[];
+    root: string; scope: string; scopes?: string[]; selected: string[]; dependencies: string[];
     files: string[]; binary: string[]; context: string[];
   };
   error?: string;
@@ -48,6 +72,38 @@ const relative = (root: string, target: string) => path.relative(root, target).s
 const unique = (values: string[]) => [...new Map(values.map(value => [pathKey(value), value])).values()];
 const lineCount = (text: string) => text ? text.replace(/\r\n/g, '\n').split('\n').length - (text.endsWith('\n') ? 1 : 0) : 0;
 const numbered = (text: string) => text.replace(/\r\n/g, '\n').split('\n').slice(0, lineCount(text)).map((line, index) => `${index + 1} | ${line}`).join('\n');
+
+function normalizeSelection(input: SelectionInput): ReviewSelection {
+  const folders = unique(('scopes' in input ? input.scopes : [input.scope]).map(folder => path.resolve(folder))).sort();
+  if (!folders.length) throw new Error('没有可用的审查管理范围。');
+  return {
+    executable: input.executable, root: path.resolve(input.root),
+    scopes: folders.filter(folder => !folders.some(other => other !== folder && within(other, folder))),
+    explicit: unique(input.explicit.map(target => path.resolve(target))).sort(),
+    targets: unique(input.targets.map(target => path.resolve(target))).sort(),
+    dependencies: unique(input.dependencies.map(target => path.resolve(target))).sort()
+  };
+}
+
+async function scopedPath(selection: Pick<ReviewSelection, 'scopes'>, target: string): Promise<string> {
+  const folder = selection.scopes.find(scope => within(scope, target));
+  if (!folder) throw new Error(`${target} 超出指定审查范围。`);
+  await checkPath(folder, target);
+  return folder;
+}
+
+async function readState(selection: Pick<ReviewSelection, 'executable' | 'scopes' | 'root'>): Promise<{ changes: Change[]; ancestors: Change[] }> {
+  const changes = new Map<string, Change>();
+  const ancestors = new Map<string, Change>();
+  for (const scope of selection.scopes) {
+    if (pathKey(await fs.realpath(scope)) !== pathKey(scope)) throw new Error('审查管理目录不能经过符号链接。');
+    const state = await readChanges(selection.executable, scope);
+    if (!state || pathKey(state.root) !== pathKey(selection.root)) throw new Error('工作副本已变化或管理范围跨越多个工作副本。');
+    for (const item of state.changes) changes.set(pathKey(item.path), item);
+    for (const item of state.ancestors) ancestors.set(pathKey(item.path), item);
+  }
+  return { changes: [...changes.values()], ancestors: [...ancestors.values()] };
+}
 
 // A lexical scope check alone would allow a symlinked ancestor to escape it.
 async function checkPath(scope: string, target: string): Promise<void> {
@@ -64,14 +120,14 @@ async function checkPath(scope: string, target: string): Promise<void> {
   }
 }
 
-async function choose(selection: Pick<ReviewSelection, 'executable' | 'scope' | 'root'>, changes: Change[], paths: string[]): Promise<ReviewSelection> {
-  const { root, scope } = selection;
+async function choose(selection: Pick<ReviewSelection, 'executable' | 'scopes' | 'root'>, changes: Change[], paths: string[]): Promise<ReviewSelection> {
+  const { root, scopes } = selection;
   const selected = new CommitSelection(root);
   selected.reconcile(changes);
   const explicit = unique(paths.map(target => deletedTreeRoot(target, changes)?.path ?? target));
   const deletions: string[] = [];
   for (const target of explicit) {
-    await checkPath(scope, target);
+    await scopedPath(selection, target);
     const change = changes.find(item => pathKey(item.path) === pathKey(target));
     if (!change) throw new Error(`${relative(root, target)} 没有可审查的 SVN 变更。`);
     if (change.conflicted) throw new Error(`${relative(root, target)} 存在冲突。`);
@@ -82,7 +138,7 @@ async function choose(selection: Pick<ReviewSelection, 'executable' | 'scope' | 
       continue; // The destination supplies this source as a dependency.
     }
     if (change.item === 'deleted' && change.kind === 'file') deletions.push(target);
-    else await selected.add(change, [scope]);
+    else await selected.add(change, scopes);
   }
   const targets = unique([...selected.targets, ...deletions]).sort();
   return {
@@ -115,13 +171,13 @@ export async function resolveReviewSelection(executable: string, scope: string, 
     candidates.push(...matches.map(change => change.path));
   }
   if (!candidates.length) throw new Error('没有待审查的 SVN 变更。');
-  return choose({ executable, scope, root: state.root }, [...state.ancestors, ...state.changes], candidates);
+  return choose({ executable, scopes: [scope], root: state.root }, [...state.ancestors, ...state.changes], candidates);
 }
 
 async function collect(selection: ReviewSelection): Promise<ReviewFile[]> {
-  const { executable, scope, root } = selection;
-  const state = await readChanges(executable, scope);
-  if (!state || pathKey(state.root) !== pathKey(root)) throw new Error('工作副本已变化。');
+  const { executable, root } = selection;
+  if (!selection.explicit.length || !selection.targets.length) throw new Error('没有提交选择。');
+  const state = await readState(selection);
   const current = await choose(selection, [...state.ancestors, ...state.changes], selection.explicit);
   if (JSON.stringify(current.targets) !== JSON.stringify(unique(selection.targets).sort())) throw new Error('必需提交依赖已变化。');
   const expanded: string[] = [];
@@ -136,7 +192,7 @@ async function collect(selection: ReviewSelection): Promise<ReviewFile[]> {
   const targets = unique(expanded).sort();
   const files: ReviewFile[] = [];
   for (const target of targets) {
-    await checkPath(scope, target);
+    const scope = await scopedPath(selection, target);
     const change = state.changes.find(item => pathKey(item.path) === pathKey(target))!;
     if (change.conflicted || !['normal', 'modified', 'added', 'deleted'].includes(change.item)) {
       throw new Error(`${relative(root, target)}：不支持 ${changeLabel(change)} 状态。`);
@@ -225,42 +281,67 @@ function parseReview(text: string, files: ReviewFile[], contexts: ContextFile[])
 async function contextFile(selection: ReviewSelection, value: string): Promise<ContextFile> {
   if (path.isAbsolute(value) || /^[A-Za-z]:|\\/.test(value)) throw new Error('上下文必须是工作副本相对路径。');
   const target = path.resolve(selection.root, value);
-  await checkPath(selection.scope, target);
-  const content = await readBaseContent(selection.executable, selection.scope, selection.root, target);
+  const scope = await scopedPath(selection, target);
+  const content = await readBaseContent(selection.executable, scope, selection.root, target);
   if (content.binary || content.symbolicLink || content.text === undefined) throw new Error('上下文不是普通文本文件。');
   return { file: relative(selection.root, target), version: 'BASE', content: content.text };
 }
 
-// No VS Code state or terminal output here: the host supplies a resolved
-// selection, effective settings, key, prompt and cancellation signal.
+// Keep the CLI result contract; host sessions additionally retain review evidence.
 export async function reviewSelection(
-  selection: ReviewSelection, settings: AiSettings, apiKey: string, prompt: string, intent = '', signal?: AbortSignal
+  selection: SelectionInput, settings: AiSettings, apiKey: string, prompt: string, intent = '', signal?: AbortSignal
 ): Promise<ReviewResult> {
+  return (await runReview({ selection: normalizeSelection(selection), settings, apiKey, prompt, intent }, signal)).result;
+}
+
+export async function runReview(input: ReviewInput, signal?: AbortSignal): Promise<ReviewSession> {
+  const selection = normalizeSelection(input.selection);
+  const { settings, apiKey, prompt, intent = '' } = input;
   const result: ReviewResult = {
     status: 'error', findings: [], context_requests: [], requests: 0,
     coverage: {
-      root: selection.root, scope: selection.scope,
+      root: selection.root, scope: selection.scopes[0],
+      ...(selection.scopes.length > 1 ? { scopes: selection.scopes } : {}),
       selected: selection.explicit.map(target => relative(selection.root, target)),
       dependencies: selection.dependencies.map(target => relative(selection.root, target)),
       files: [], binary: [], context: []
     }
   };
+  let files: ReviewFile[] = [];
+  const contexts: ContextFile[] = [];
+  let basis: string | undefined;
+  const unchanged = async () => {
+    try {
+      if (basis === undefined || JSON.stringify(await collect(selection)) !== basis) return false;
+      for (const item of contexts) {
+        if (JSON.stringify(await contextFile(selection, item.file)) !== JSON.stringify(item)) return false;
+      }
+      return true;
+    } catch { return false; }
+  };
+  const session: ReviewSession = {
+    result,
+    async isCurrent(current) {
+      try {
+        return !signal?.aborted && ['clean', 'findings', 'incomplete'].includes(result.status)
+          && JSON.stringify(normalizeSelection(current)) === JSON.stringify(selection) && await unchanged();
+      } catch { return false; }
+    },
+    snapshot(finding) {
+      if (!result.findings.includes(finding)) throw new Error('该问题不属于本次审查结果。');
+      const file = files.find(item => item.file === finding.file);
+      const context = contexts.find(item => item.file === finding.file);
+      const text = context?.content ?? (finding.side === 'old' ? file?.content.base : file?.content.text);
+      if (text === undefined) throw new Error('审查快照不可用。');
+      return { file: finding.file, side: finding.side, text, lineStart: finding.line_start, lineEnd: finding.line_end };
+    }
+  };
+  const stale = () => { result.status = 'stale'; result.error = '审查依据已变化，请重新审查。'; return session; };
   try {
-    const files = await collect(selection);
+    files = await collect(selection);
     result.coverage.files = files.map(item => item.file);
     result.coverage.binary = files.filter(item => item.content.binary).map(item => item.file);
-    const basis = JSON.stringify(files);
-    const contexts: ContextFile[] = [];
-    const unchanged = async () => {
-      try {
-        if (JSON.stringify(await collect(selection)) !== basis) return false;
-        for (const item of contexts) {
-          if (JSON.stringify(await contextFile(selection, item.file)) !== JSON.stringify(item)) return false;
-        }
-        return true;
-      } catch { return false; }
-    };
-    const stale = () => { result.status = 'stale'; result.error = '审查依据已变化，请重新审查。'; return result; };
+    basis = JSON.stringify(files);
     const request = async () => {
       const messages = buildMessages(prompt, selection.root, files, contexts, intent);
       if (messages.system.length + messages.user.length > maxInputCharacters) throw new Error('审查输入超过 60,000 字符，请缩小提交选择。');
@@ -275,13 +356,10 @@ export async function reviewSelection(
     for (const item of review.context_requests) {
       try {
         const target = path.resolve(selection.root, item.file_or_symbol);
-        // Selected files already have their complete submitted text in the input.
         if (files.some(file => pathKey(file.change.path) === pathKey(target))) throw new Error('已提供所选文件内容，无法进一步解析符号。');
         const content = await contextFile(selection, item.file_or_symbol);
         if (!contexts.some(file => file.file === content.file)) contexts.push(content);
-      } catch {
-        unresolved.push(item);
-      }
+      } catch { unresolved.push(item); }
     }
     if (contexts.length) {
       result.coverage.context = contexts.map(item => item.file);
@@ -292,13 +370,12 @@ export async function reviewSelection(
     result.findings = review.findings;
     result.context_requests = [...unresolved, ...review.context_requests]
       .filter((item, index, all) => all.findIndex(other => other.file_or_symbol === item.file_or_symbol) === index).slice(0, 3);
-    result.coverage.context = contexts.map(item => item.file);
     result.status = result.context_requests.length || result.coverage.binary.length ? 'incomplete' : result.findings.length ? 'findings' : 'clean';
-    return result;
+    return session;
   } catch (error) {
     result.status = 'error';
     const message = error instanceof Error ? error.message : String(error);
     result.error = apiKey ? message.split(apiKey).join('[已隐藏]') : message;
-    return result;
+    return session;
   }
 }

@@ -42,3 +42,5 @@ old 通常为 BASE，复制或移动目标以复制来源修订为基线；new �
 ## 运行与验收
 
 Node.js 22+，先 `npm run build`，再 `node tools/review.cjs …`。定向测试使用真实临时 SVN 仓库、可控本地 HTTP 服务和 CLI 子进程，验证输入边界、配置复用、删除/复制/移动/目录属性、JSON/退出码、上下文补充、过期、超时及草稿传输兼容；另运行类型检查。实际远程模型、Windows 环境和后续插件按钮集成需另行验收。
+
+插件接入行为、多目录范围、审查会话及提交前重验见 [插件接入 SVN 提交前审查](../docs/review-integration-design.md)。CLI 与插件共用审查核心和内置提示词。
