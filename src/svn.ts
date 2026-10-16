@@ -363,11 +363,15 @@ export async function readDifference(executable: string, folder: string, change:
 export async function readTextDifference(executable: string, folder: string, target: string, display: string): Promise<string> {
   const name = path.relative(folder, target) || '.';
   const output = await run(executable, folder, [
-    'diff', '--internal-diff', '-x', '--ignore-eol-style', '--ignore-properties', '--', `${name}@`
+    'diff', '--internal-diff', '-x', '--ignore-eol-style', '--ignore-properties', '--', name
   ]);
   const start = output.search(/^@@ /m);
   if (start === -1) return '';
-  const hunks = output.slice(start).replace(/\r\n|\r/g, '\n').trimEnd();
+  const hunks = output.slice(start).replace(/\r\n|\r/g, '\n')
+    .replace(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/gm,
+      (_match, oldStart: string, oldCount: string | undefined, newStart: string, newCount: string | undefined) =>
+        `@@ -${oldStart},${oldCount ?? '1'} +${newStart},${newCount ?? '1'} @@`)
+    .trimEnd();
   return `--- a/${display}\n+++ b/${display}\n${hunks}`;
 }
 

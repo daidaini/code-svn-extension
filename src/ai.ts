@@ -182,7 +182,7 @@ function lines(text: string): string[] {
   return parts;
 }
 
-function isDiffTooLargeForLcs(before: string, after: string): boolean {
+export function isDiffTooLargeForLcs(before: string, after: string): boolean {
   const oldLines = lines(before);
   const newLines = lines(after);
   let start = 0;

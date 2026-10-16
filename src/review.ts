@@ -1,8 +1,8 @@
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
-import { AiSettings, requestMessages, textDiff } from './ai';
+import { AiSettings, isDiffTooLargeForLcs, requestMessages, textDiff } from './ai';
 import { CommitSelection, deletedTreeRoot, pathKey, within } from './commit-selection';
-import { Change, ChangeContent, changeLabel, readChanges, readDifference } from './svn';
+import { Change, ChangeContent, changeLabel, readChanges, readDifference, readTextDifference } from './svn';
 
 export interface ReviewSelection {
   executable: string;
@@ -199,7 +199,15 @@ async function collect(selection: ReviewSelection): Promise<ReviewFile[]> {
     if (content.properties.some(prop => prop.name === 'svn:special')) throw new Error(`${relative(root, target)}：不支持特殊文件。`);
     if (kind === 'file' && change.item !== 'deleted' && content.text === undefined) throw new Error(`${relative(root, target)}：本地文件不可读取。`);
     const file = relative(root, target);
-    files.push({ file, change, kind, content, diff: content.binary ? '' : textDiff(file, content.base ?? '', content.text ?? '') });
+    let diff = '';
+    if (!content.binary) {
+      const before = content.base ?? '';
+      const after = content.text ?? '';
+      diff = isDiffTooLargeForLcs(before, after)
+        ? await readTextDifference(executable, scope, target, file)
+        : textDiff(file, before, after);
+    }
+    files.push({ file, change, kind, content, diff });
   }
   return files;
 }

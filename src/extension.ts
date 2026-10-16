@@ -189,10 +189,17 @@ export function activate(context: vscode.ExtensionContext): void {
           .map(change => change.path);
         return paths.map(target => ({ label: path.basename(target), description: `${view.scm.rootUri!.fsPath} · ${path.relative(view.scm.rootUri!.fsPath, target)}`, view, target }));
       });
-      const choice = resource?.resourceUri
+      const picked = resource?.resourceUri
         ? choices.find(item => pathKey(item.target) === pathKey(resource.resourceUri.fsPath))
-        : await vscode.window.showQuickPick(choices, { placeHolder: remove ? '选择要移出待提交的文件或目录' : '选择要加入待提交的文件或目录' });
-      if (!choice) {
+        : await vscode.window.showQuickPick(choices, {
+          canPickMany: !remove,
+          placeHolder: remove ? '选择要移出待提交的文件或目录' : '选择要加入待提交的文件或目录（可多选；选择目录会包含其下所有变更）'
+        });
+      type ChangeChoice = (typeof choices)[number];
+      const selected: ChangeChoice[] = Array.isArray(picked)
+        ? [...picked] as ChangeChoice[]
+        : picked ? [picked as ChangeChoice] : [];
+      if (!selected.length) {
         // Excluded items are not choices: a resource-row click on one must
         // guide to the operation that owns it instead of failing silently or
         // pretending it is a separate commit.
@@ -216,16 +223,28 @@ export function activate(context: vscode.ExtensionContext): void {
         }
         return;
       }
-      const key = pathKey(choice.view.scm.rootUri!.fsPath);
-      if (views.get(key) !== choice.view) throw new Error('工作副本或管理范围已变化，请重新选择。');
-      const reviewRun = reviewRuns.get(key);
-      if (reviewRun) {
-        reviewRun.invalidReason = '提交选择已变化。';
-        reviewRun.controller.abort();
-        await reviewRun.done;
+      const groups = new Map<WorkingCopyView, typeof selected>();
+      for (const choice of selected) {
+        const group = groups.get(choice.view) ?? [];
+        group.push(choice);
+        groups.set(choice.view, group);
       }
-      if (writes.isBusy(key)) throw new Error('该工作副本正在执行写操作，请等待完成。');
+      for (const [view] of groups) {
+        const key = pathKey(view.scm.rootUri!.fsPath);
+        if (views.get(key) !== view) throw new Error('工作副本或管理范围已变化，请重新选择。');
+        if (writes.isBusy(key)) throw new Error('该工作副本正在执行写操作，请等待完成。');
+      }
+      for (const [view] of groups) {
+        const key = pathKey(view.scm.rootUri!.fsPath);
+        const reviewRun = reviewRuns.get(key);
+        if (reviewRun) {
+          reviewRun.invalidReason = '提交选择已变化。';
+          reviewRun.controller.abort();
+          await reviewRun.done;
+        }
+      }
       if (remove) {
+        const choice = selected[0];
         const change = choice.view.changes.find(change => pathKey(change.path) === pathKey(choice.target));
         if (change && (change.kind === 'dir'
           || (change.item !== 'deleted' && (await fs.lstat(change.path)).isDirectory()))) {
@@ -234,17 +253,24 @@ export function activate(context: vscode.ExtensionContext): void {
         else choice.view.selected.remove(choice.target);
       }
       else {
-        const change = choice.view.changes.find(change => pathKey(change.path) === pathKey(choice.target));
-        if (!change) throw new Error('变更状态或管理范围已变化，请刷新后重新选择。');
-        const isDirectory = change.kind === 'dir'
-          || (change.item !== 'deleted' && (await fs.lstat(change.path)).isDirectory());
-        const changes = isDirectory && change.item !== 'deleted'
-          ? choice.view.changes.filter(item => within(change.path, item.path)
-            && !(item.item === 'deleted' && (deletedTreeRoot(item.path, choice.view.changes) || item.movedTo)))
-          : [change];
-        await choice.view.selected.addMany(changes, openedFolders().map(folder => folder.uri.fsPath));
+        const scopes = openedFolders().map(folder => folder.uri.fsPath);
+        for (const [view, choicesForView] of groups) {
+          const additions = new Map<string, Change>();
+          for (const choice of choicesForView) {
+            const change = view.changes.find(change => pathKey(change.path) === pathKey(choice.target));
+            if (!change) throw new Error('变更状态或管理范围已变化，请刷新后重新选择。');
+            const isDirectory = change.kind === 'dir'
+              || (change.item !== 'deleted' && (await fs.lstat(change.path)).isDirectory());
+            const changes = isDirectory && change.item !== 'deleted'
+              ? view.changes.filter(item => within(change.path, item.path)
+                && !(item.item === 'deleted' && (deletedTreeRoot(item.path, view.changes) || item.movedTo)))
+              : [change];
+            for (const item of changes) additions.set(pathKey(item.path), item);
+          }
+          await view.selected.addMany([...additions.values()], scopes);
+        }
       }
-      showChanges(choice.view, choice.view.changes);
+      for (const view of groups.keys()) showChanges(view, view.changes);
       reassessDrafts();
     } catch (error) {
       void vscode.window.showErrorMessage(error instanceof Error ? error.message : String(error));
