@@ -360,6 +360,17 @@ export async function readDifference(executable: string, folder: string, change:
   return { ...content, binary: content.binary || isBinaryMime(before, after), properties: propertyChanges(before, after) };
 }
 
+export async function readTextDifference(executable: string, folder: string, target: string, display: string): Promise<string> {
+  const name = path.relative(folder, target) || '.';
+  const output = await run(executable, folder, [
+    'diff', '--internal-diff', '-x', '--ignore-eol-style', '--ignore-properties', '--', `${name}@`
+  ]);
+  const start = output.search(/^@@ /m);
+  if (start === -1) return '';
+  const hunks = output.slice(start).replace(/\r\n|\r/g, '\n').trimEnd();
+  return `--- a/${display}\n+++ b/${display}\n${hunks}`;
+}
+
 function propertyChanges(before: Map<string, PropertyValue>, after: Map<string, PropertyValue>): PropertyChange[] {
   const changes: PropertyChange[] = [];
   for (const [property, value] of before) {

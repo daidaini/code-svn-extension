@@ -1,7 +1,7 @@
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { pathKey, within } from './commit-selection';
-import { Change, ChangeContent, changeLabel, PropertyChange, PropertyValue, readDifference } from './svn';
+import { Change, ChangeContent, changeLabel, PropertyChange, PropertyValue, readDifference, readTextDifference } from './svn';
 
 // Every selected change is described: text differences, property changes, added,
 // deleted and directory items. Binary content is never sent, only its path and type.
@@ -137,7 +137,14 @@ export async function collectDraftInput(
       // An added file compares against nothing; a copy compares against its copy source.
       const before = content.base ?? (change.item === 'added' ? '' : undefined);
       if (content.text === undefined || before === undefined) { unsupported.push(`${display}：没有可比对的文本内容`); continue; }
-      diff = textDiff(display, before, content.text);
+      try {
+        diff = isDiffTooLargeForLcs(before, content.text)
+          ? await readTextDifference(executable, folder, target, display)
+          : textDiff(display, before, content.text);
+      } catch (error) {
+        unsupported.push(`${display}：读取 SVN 文本差异失败（${error instanceof Error ? error.message : String(error)}）`);
+        continue;
+      }
     }
     if (change.item === 'modified' && !diff && properties.length === 0) {
       unsupported.push(`${display}：没有文本内容差异`);
@@ -173,6 +180,20 @@ function lines(text: string): string[] {
   const parts = text.split(/\r\n|\r|\n/);
   if (parts.length > 0 && parts[parts.length - 1] === '') parts.pop();
   return parts;
+}
+
+function isDiffTooLargeForLcs(before: string, after: string): boolean {
+  const oldLines = lines(before);
+  const newLines = lines(after);
+  let start = 0;
+  while (start < oldLines.length && start < newLines.length && oldLines[start] === newLines[start]) start++;
+  let endBefore = oldLines.length;
+  let endAfter = newLines.length;
+  while (endBefore > start && endAfter > start && oldLines[endBefore - 1] === newLines[endAfter - 1]) {
+    endBefore--;
+    endAfter--;
+  }
+  return (endBefore - start) * (endAfter - start) > maxDiffCells;
 }
 
 type Op = { kind: '-' | '+' | ' '; text: string };
