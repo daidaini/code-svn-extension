@@ -2,7 +2,7 @@
   "name": "code-svn-extension",
   "displayName": "Code SVN",
   "description": "在打开目录内管理 SVN 项目",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "publisher": "daidaini",
   "repository": {
     "type": "git",
