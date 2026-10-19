@@ -594,8 +594,8 @@ export async function readHistoryBatch(executable: string, folder: string, url: 
   return { entries: entries.slice(0, historyBatchSize), hasMore: entries.length > historyBatchSize };
 }
 
-export async function addPath(executable: string, root: string, target: string): Promise<void> {
-  await run(executable, root, ['add', '--depth', 'empty', '--', `${path.relative(root, target)}@`]);
+export async function addPath(executable: string, root: string, target: string, depth: 'empty' | 'infinity' = 'empty'): Promise<void> {
+  await run(executable, root, ['add', '--depth', depth, '--', `${path.relative(root, target)}@`]);
 }
 
 export async function commitFiles(executable: string, root: string, targets: string[], message: string): Promise<number> {

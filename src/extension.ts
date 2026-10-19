@@ -286,7 +286,7 @@ export function activate(context: vscode.ExtensionContext): void {
         .map(change => ({ label: path.basename(change.path), description: change.path, key, view, change })));
       const choice = resource?.resourceUri
         ? choices.find(item => pathKey(item.change.path) === pathKey(resource.resourceUri.fsPath))
-        : await vscode.window.showQuickPick(choices, { placeHolder: '选择要添加到 SVN 的文件或目录（目录仅添加自身）' });
+        : await vscode.window.showQuickPick(choices, { placeHolder: '选择要递归添加到 SVN 的文件或目录' });
       if (!choice) return;
       release = writes.tryAcquire(choice.key);
       if (!release) throw new Error('该工作副本正在执行写操作，请等待完成。');
@@ -297,7 +297,8 @@ export function activate(context: vscode.ExtensionContext): void {
         throw new Error('变更状态或管理范围已变化，请刷新后重新添加。');
       }
       await choice.view.selected.validateAddition(choice.change, openedFolders().map(folder => folder.uri.fsPath));
-      await addPath(svnExecutable(folder), choice.view.scm.rootUri!.fsPath, choice.change.path);
+      const isDirectory = (await fs.lstat(choice.change.path)).isDirectory();
+      await addPath(svnExecutable(folder), choice.view.scm.rootUri!.fsPath, choice.change.path, isDirectory ? 'infinity' : 'empty');
       await refresh();
       if (views.get(choice.key) !== choice.view || choice.view.lastError) throw new Error('SVN 添加已执行，但刷新失败，请核对状态后继续。');
       void vscode.window.showInformationMessage(`${path.basename(choice.change.path)} 已添加到 SVN，尚未加入待提交；请审阅后明确选择。`);
