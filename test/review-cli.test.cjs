@@ -144,18 +144,18 @@ test('整体目录删除覆盖子文件，目录属性也进入输入', async t 
   assert.match(f.requests[0].payload.messages[1].content, /review:flag/);
 });
 
-test('新增父目录和移动源被列为必需依赖，复制比较复制来源基线', async t => {
+test('新增父目录和移动源进入审查输入，复制比较复制来源基线', async t => {
   const f = await fixture(t);
   await fs.mkdir(path.join(f.scope, 'newdir'));
   await f.edit('newdir/new.js', 'export const fresh = 1;\n');
   f.svn('add', '--', 'newdir@');
   const added = await f.run(['newdir/new.js']);
   assert.equal(added.code, 0, added.stdout);
-  assert.deepEqual(added.result.coverage.dependencies, ['范围 @目录/newdir']);
+  assert.ok(added.result.coverage.files.includes('范围 @目录/newdir/new.js'));
   f.svn('move', '--', 'main.js@', 'moved.js');
   const moved = await f.run(['moved.js']);
   assert.equal(moved.code, 0, moved.stdout);
-  assert.ok(moved.result.coverage.dependencies.includes('范围 @目录/main.js'));
+  assert.ok(moved.result.coverage.files.includes('范围 @目录/main.js'));
   f.svn('copy', '--', 'helper.js@', 'copied.js');
   await f.edit('copied.js', 'export const allowed = false;\n');
   const copied = await f.run(['copied.js']);
@@ -163,18 +163,15 @@ test('新增父目录和移动源被列为必需依赖，复制比较复制来�
   assert.match(f.requests.at(-1).payload.messages[1].content, /-export const allowed = true/);
 });
 
-test('只补充一次未选文件 BASE，忽略其本地修改并校验审查问题', async t => {
-  const f = await fixture(t, (_f, _request, count) => count === 1
-    ? { findings: [], context_requests: [{ file_or_symbol: '范围 @目录/helper.js', reason: '确认调用约束' }] }
-    : { findings: [finding], context_requests: [] });
+test('未选文件内容不进入输入，审查只发送一次请求', async t => {
+  const f = await fixture(t);
   await f.edit();
   await f.edit('helper.js', 'UNSELECTED_LOCAL_CONTENT\n');
   const run = await f.run(['main.js']);
-  assert.equal(run.code, 1, run.stdout);
-  assert.equal(f.requests.length, 2);
-  assert.deepEqual(run.result.coverage.context, ['范围 @目录/helper.js']);
-  assert.match(f.requests[1].payload.messages[1].content, /allowed = true/);
-  assert.doesNotMatch(f.requests[1].payload.messages[1].content, /UNSELECTED_LOCAL_CONTENT/);
+  assert.equal(run.code, 0, run.stdout);
+  assert.equal(f.requests.length, 1);
+  assert.match(f.requests[0].payload.messages[1].content, /return value - 1/);
+  assert.doesNotMatch(f.requests[0].payload.messages[1].content, /UNSELECTED_LOCAL_CONTENT/);
 });
 
 test('共享核心按精确选择处理复制目录，CLI 目录选择才展开本地子项修改', async t => {
@@ -195,53 +192,35 @@ test('共享核心按精确选择处理复制目录，CLI 目录选择才展开�
   assert.match(f.requests[1].payload.messages[1].content, /UNSELECTED_COPY_EDIT/);
 });
 
-test('必要位置可定位已补充 BASE 的 old 行，不能虚构工作副本行', async t => {
-  let side = 'old';
-  const f = await fixture(t, (_f, _request, count) => count % 2 === 1
-    ? { findings: [], context_requests: [{ file_or_symbol: '范围 @目录/helper.js', reason: '定位相关约束' }] }
-    : { findings: [{ ...finding, file: '范围 @目录/helper.js', side, line_start: 1, line_end: 1 }], context_requests: [] });
+test('未选文件的问题被拒绝，审查范围不因模型输出扩大', async t => {
+  const f = await fixture(t, () => ({ findings: [{ ...finding, file: '范围 @目录/helper.js' }] }));
   await f.edit();
-  const old = await f.run(['main.js']);
-  assert.equal(old.code, 1, old.stdout);
-  side = 'new';
-  const invented = await f.run(['main.js']);
-  assert.equal(invented.code, 2, invented.stdout);
+  const run = await f.run(['main.js']);
+  assert.equal(run.code, 2, run.stdout);
+  assert.equal(run.result.requests, 1);
 });
 
-test('文件 external 不得成为补充上下文', async t => {
-  const f = await fixture(t, () => ({ findings: [], context_requests: [{ file_or_symbol: '范围 @目录/external.js', reason: '确认调用约束' }] }));
+test('文件 external 内容不进入审查输入', async t => {
+  const f = await fixture(t);
   f.svn('propset', 'svn:externals', '^/sibling/outside.js external.js', '--', '.@');
   f.svn('update');
   await f.edit();
   const run = await f.run(['main.js']);
-  assert.equal(run.code, 3, run.stdout);
+  assert.equal(run.code, 0, run.stdout);
+  assert.equal(f.requests.length, 1);
+  assert.doesNotMatch(f.requests[0].payload.messages[1].content, /OUTSIDE_SCOPE_CONTENT/);
+});
+
+test('模型请求的补充上下文被忽略，仍只发送一次请求', async t => {
+  const f = await fixture(t, () => ({ findings: [], context_requests: [{ file_or_symbol: 'sibling/outside.js', reason: '确认具体约束' }] }));
+  await f.edit();
+  const run = await f.run(['main.js']);
+  assert.equal(run.code, 0, run.stdout);
   assert.equal(run.result.requests, 1);
   assert.doesNotMatch(f.requests[0].payload.messages[1].content, /OUTSIDE_SCOPE_CONTENT/);
 });
 
-test('范围外、符号、嵌套工作副本与二次上下文请求均保持不完整', async t => {
-  let requested = 'sibling/outside.js';
-  const f = await fixture(t, () => ({ findings: [], context_requests: [{ file_or_symbol: requested, reason: '确认具体约束' }] }));
-  await f.edit();
-  for (const value of ['sibling/outside.js', '../outside.js', '/etc/passwd', 'UnknownSymbol']) {
-    requested = value;
-    const run = await f.run(['main.js']);
-    assert.equal(run.code, 3, run.stdout);
-    assert.equal(run.result.requests, 1);
-    assert.doesNotMatch(f.requests.at(-1).payload.messages[1].content, /OUTSIDE_SCOPE_CONTENT/);
-  }
-  svn(f.scope, 'checkout', f.url, 'nested');
-  requested = '范围 @目录/nested/范围 @目录/helper.js';
-  const nested = await f.run(['main.js']);
-  assert.equal(nested.code, 3);
-  assert.equal(nested.result.requests, 1);
-  requested = '范围 @目录/helper.js';
-  const repeated = await f.run(['main.js']);
-  assert.equal(repeated.code, 3, repeated.stdout);
-  assert.equal(repeated.result.requests, 2);
-});
-
-test('选定代码或已补充 BASE 变化时结果过期', async t => {
+test('选定代码变化时结果过期', async t => {
   const f = await fixture(t, async (f, _request, count) => {
     if (count === 1) await f.edit('main.js', 'CHANGED_DURING_REVIEW\n');
     return clean;
@@ -250,16 +229,6 @@ test('选定代码或已补充 BASE 变化时结果过期', async t => {
   const run = await f.run(['main.js']);
   assert.equal(run.code, 4, run.stdout);
   assert.equal(run.result.status, 'stale');
-
-  const g = await fixture(t, async (g, _request, count) => {
-    if (count === 1) return { findings: [], context_requests: [{ file_or_symbol: '范围 @目录/helper.js', reason: '确认约束' }] };
-    await g.edit('helper.js', 'export const allowed = false;\n');
-    g.svn('commit', '-m', 'change context base', '--', 'helper.js@');
-    return clean;
-  });
-  await g.edit();
-  const context = await g.run(['main.js']);
-  assert.equal(context.code, 4, context.stdout);
 });
 
 test('非法模型 JSON、置信度和行号均拒绝，错误输出不泄露 Key', async t => {
@@ -268,8 +237,7 @@ test('非法模型 JSON、置信度和行号均拒绝，错误输出不泄露 Ke
   await f.edit();
   for (const value of ['not JSON', { findings: [{ ...finding, confidence: 'low' }], context_requests: [] },
     { findings: [{ ...finding, line_end: 999 }], context_requests: [] },
-    { findings: [{ ...finding, file: 'sibling/outside.js' }], context_requests: [] },
-    { findings: [], context_requests: [{ file_or_symbol: apiKey }] }]) {
+    { findings: [{ ...finding, file: 'sibling/outside.js' }], context_requests: [] }]) {
     output = value;
     const run = await f.run(['main.js']);
     assert.equal(run.code, 2, run.stdout);
@@ -283,7 +251,8 @@ test('二进制内容不发送，输入超限、未跟踪与符号链接不发�
   await f.edit('main.js', Buffer.from([0, 1, 2, 3]));
   const binary = await f.run(['main.js']);
   assert.equal(binary.code, 3, binary.stdout);
-  assert.deepEqual(binary.result.coverage.binary, ['范围 @目录/main.js']);
+  assert.equal(binary.result.status, 'incomplete');
+  assert.doesNotMatch(f.requests[0].payload.messages[1].content, /范围 @目录\/main\.js/);
   await f.edit('main.js', 'x'.repeat(70000));
   const count = f.requests.length;
   const large = await f.run(['main.js']);
