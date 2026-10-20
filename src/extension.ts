@@ -3,7 +3,7 @@ import * as path from 'node:path';
 import * as fs from 'node:fs/promises';
 import { watch } from 'node:fs';
 import { createHash } from 'node:crypto';
-import { CommitSelection, WorkingCopyWrites, deletedTreeRoot, pathKey, within } from './commit-selection';
+import { CommitSelection, WorkingCopyWrites, deletedTreeRoot, expand, pathKey, within } from './commit-selection';
 import {
   AiCancelled, DraftInput, AiSettings, apiKeySecret, assertInputWithinLimit, collectDraftInput, draftBasis, configurationProblems, requestDraft
 } from './ai';
@@ -180,15 +180,17 @@ export function activate(context: vscode.ExtensionContext): void {
   async function chooseChange(remove: boolean, resource?: vscode.SourceControlResourceState): Promise<void> {
     try {
       await refresh();
-      const choices = [...views.values()].flatMap(view => {
-        const paths = remove ? view.selected.explicitTargets : view.changes
-          // Never offer the misleading per-child splitting of a whole-tree
-          // deletion, or the source side of a recorded move.
-          .filter(change => !view.selected.has(change.path)
-            && !(change.item === 'deleted' && (deletedTreeRoot(change.path, view.changes) || change.movedTo)))
-          .map(change => change.path);
+      const choiceGroups = await Promise.all([...views.values()].map(async view => {
+        // The module owns what is selectable: expand() over every change yields
+        // exactly the operations a user may name, without the misleading per-child
+        // splitting of a whole-tree deletion or the source side of a recorded move.
+        const { operations } = await expand(view.changes.map(change => change.path), view.changes);
+        const selectable = new Set(operations.map(operation => pathKey(operation.path)));
+        const paths = (remove ? view.selected.explicitTargets : view.changes.map(change => change.path))
+          .filter(target => !view.selected.has(target) && (remove || selectable.has(pathKey(target))));
         return paths.map(target => ({ label: path.basename(target), description: `${view.scm.rootUri!.fsPath} · ${path.relative(view.scm.rootUri!.fsPath, target)}`, view, target }));
-      });
+      }));
+      const choices = choiceGroups.flat();
       const picked = resource?.resourceUri
         ? choices.find(item => pathKey(item.target) === pathKey(resource.resourceUri.fsPath))
         : await vscode.window.showQuickPick(choices, {
@@ -255,19 +257,22 @@ export function activate(context: vscode.ExtensionContext): void {
       else {
         const scopes = openedFolders().map(folder => folder.uri.fsPath);
         for (const [view, choicesForView] of groups) {
-          const additions = new Map<string, Change>();
-          for (const choice of choicesForView) {
-            const change = view.changes.find(change => pathKey(change.path) === pathKey(choice.target));
-            if (!change) throw new Error('变更状态或管理范围已变化，请刷新后重新选择。');
-            const isDirectory = change.kind === 'dir'
-              || (change.item !== 'deleted' && (await fs.lstat(change.path)).isDirectory());
-            const changes = isDirectory && change.item !== 'deleted'
-              ? view.changes.filter(item => within(change.path, item.path)
-                && !(item.item === 'deleted' && (deletedTreeRoot(item.path, view.changes) || item.movedTo)))
-              : [change];
-            for (const item of changes) additions.set(pathKey(item.path), item);
+          // The module owns the operation rules: directory expansion, whole-tree
+          // deletion descendants, move pairing and dedup happen behind expand().
+          const { operations, reasons } = await expand(choicesForView.map(choice => choice.target), view.changes);
+          for (const reason of reasons) {
+            const shown = path.relative(view.scm.rootUri!.fsPath, reason.target) || path.basename(reason.target);
+            throw new Error(reason.code === 'moved-to-target'
+              ? `${path.basename(reason.target)} 已记录移动，请选择移动后的目标 ${shown} 提交这次移动；源会作为必需提交依赖一起提交。`
+              : `${path.basename(reason.target)} 随整个目录删除，不能单独提交受影响子项；请选择目录 ${shown} 本身，以整个子树为一次操作提交。`);
           }
-          await view.selected.addMany([...additions.values()], scopes);
+          const current = new Map(view.changes.map(change => [pathKey(change.path), change]));
+          const additions = operations.map(operation => {
+            const change = current.get(pathKey(operation.path));
+            if (!change) throw new Error('变更状态或管理范围已变化，请刷新后重新选择。');
+            return change;
+          });
+          await view.selected.addMany(additions, scopes);
         }
       }
       for (const view of groups.keys()) showChanges(view, view.changes);

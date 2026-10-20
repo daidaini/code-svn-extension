@@ -1,7 +1,7 @@
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { AiSettings, isDiffTooLargeForLcs, requestMessages, textDiff } from './ai';
-import { CommitSelection, deletedTreeRoot, pathKey, within } from './commit-selection';
+import { CommitSelection, deletedTreeRoot, expand, pathKey, within } from './commit-selection';
 import { Change, ChangeContent, changeLabel, readChanges, readDifference, readTextDifference } from './svn';
 
 export interface ReviewSelection {
@@ -116,29 +116,38 @@ async function checkPath(scope: string, target: string): Promise<void> {
   }
 }
 
-async function choose(selection: Pick<ReviewSelection, 'executable' | 'scopes' | 'root'>, changes: Change[], paths: string[]): Promise<ReviewSelection> {
+async function choose(selection: Pick<ReviewSelection, 'executable' | 'scopes' | 'root'>, changes: Change[], paths: string[], options: { directories: boolean }): Promise<ReviewSelection> {
   const { root, scopes } = selection;
+  // The commit-selection module owns the operation rules: whole-tree deletion
+  // descendants and move pairing are shared with the plugin. Directory expansion
+  // only happens for CLI argument resolution ({ directories: true }); the shared
+  // core receives an already resolved selection ({ directories: false }).
+  const { operations, reasons } = await expand(paths, changes, options);
+  for (const reason of reasons) {
+    if (reason.code === 'moved-to-target') {
+      throw new Error(`请通过移动目标 ${relative(root, reason.target)} 选择完整移动。`);
+    }
+    // A whole-tree deletion directory covers its own descendants; the CLI expands it.
+  }
   const selected = new CommitSelection(root);
   selected.reconcile(changes);
-  const explicit = unique(paths.map(target => deletedTreeRoot(target, changes)?.path ?? target));
+  const explicit: string[] = [];
   const deletions: string[] = [];
-  for (const target of explicit) {
-    await scopedPath(selection, target);
+  for (const operation of operations) {
+    // A direct pick inside a whole-tree deletion expands to the directory itself.
+    const target = deletedTreeRoot(operation.path, changes)?.path ?? operation.path;
     const change = changes.find(item => pathKey(item.path) === pathKey(target));
     if (!change) throw new Error(`${relative(root, target)} 没有可审查的 SVN 变更。`);
     if (change.conflicted) throw new Error(`${relative(root, target)} 存在冲突。`);
-    if (change.movedTo) {
-      if (!explicit.some(item => pathKey(item) === pathKey(change.movedTo!))) {
-        throw new Error(`请通过移动目标 ${relative(root, change.movedTo)} 选择完整移动。`);
-      }
-      continue; // The destination supplies this source as a dependency.
-    }
-    if (change.item === 'deleted' && change.kind === 'file') deletions.push(target);
+    explicit.push(target);
+    // Standalone deleted files stay out of the commit-selection module: the CLI
+    // reviews them, while plugin commits refuse them (caller policy).
+    if (change.item === 'deleted' && change.kind !== 'dir' && !change.movedTo) deletions.push(target);
     else await selected.add(change, scopes);
   }
   const targets = unique([...selected.targets, ...deletions]).sort();
   return {
-    ...selection, explicit: explicit.filter(target => !changes.find(change => pathKey(change.path) === pathKey(target))?.movedTo),
+    ...selection, explicit: unique(explicit).sort(),
     targets, dependencies: targets.filter(target => selected.isDependency(target) && !selected.has(target))
   };
 }
@@ -167,14 +176,14 @@ export async function resolveReviewSelection(executable: string, scope: string, 
     candidates.push(...matches.map(change => change.path));
   }
   if (!candidates.length) throw new Error('没有待审查的 SVN 变更。');
-  return choose({ executable, scopes: [scope], root: state.root }, [...state.ancestors, ...state.changes], candidates);
+  return choose({ executable, scopes: [scope], root: state.root }, [...state.ancestors, ...state.changes], candidates, { directories: true });
 }
 
 async function collect(selection: ReviewSelection): Promise<ReviewFile[]> {
   const { executable, root } = selection;
   if (!selection.explicit.length || !selection.targets.length) throw new Error('没有提交选择。');
   const state = await readState(selection);
-  const current = await choose(selection, [...state.ancestors, ...state.changes], selection.explicit);
+  const current = await choose(selection, [...state.ancestors, ...state.changes], selection.explicit, { directories: false });
   if (JSON.stringify(current.targets) !== JSON.stringify(unique(selection.targets).sort())) throw new Error('必需提交依赖已变化。');
   const expanded: string[] = [];
   for (const target of selection.targets) {

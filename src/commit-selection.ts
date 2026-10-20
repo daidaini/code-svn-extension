@@ -25,6 +25,62 @@ export function deletedTreeRoot(target: string, changes: Change[]): Change | und
   return root;
 }
 
+// Structured reasons for a direct pick that cannot be selected on its own.
+// The module knows the rule; each caller renders its own wording.
+export type SelectionReason =
+  | { code: 'moved-to-target'; target: string }
+  | { code: 'inside-tree-deletion'; target: string };
+
+// Expand user-picked paths into the commit operations they name. This is the
+// shared rule behind the plugin's live multi-select and the CLI's argument
+// resolution: a directory pick covers its descendant changes; descendants of a
+// whole-tree deletion and move sources are excluded (they ride along as the
+// directory or move-target operation); a direct pick of such an item yields a
+// structured reason instead of a silent failure. Deleted files are kept as
+// operations: standalone deletion review (CLI) and commit refusal (plugin)
+// remain caller policy. With { directories: false } the picks are already
+// resolved change paths (the shared review core), so directories are not
+// re-expanded; the ride-along and reason rules still apply.
+export async function expand(paths: string[], changes: Change[], options: { directories?: boolean } = {}): Promise<{ operations: Change[]; reasons: SelectionReason[] }> {
+  const expandDirectories = options.directories ?? true;
+  const operations = new Map<string, Change>();
+  const reasons: SelectionReason[] = [];
+  const pickedKeys = new Set(paths.map(value => pathKey(value)));
+  // Direct picks that ride along with another operation in the same batch are
+  // excluded without a reason; a pick alone gets a structured reason so callers
+  // can guide the user to the operation that owns it.
+  const deferred: SelectionReason[] = [];
+  for (const picked of paths) {
+    const root = deletedTreeRoot(picked, changes);
+    if (root) {
+      if (!pickedKeys.has(pathKey(root.path))) deferred.push({ code: 'inside-tree-deletion', target: root.path });
+      continue;
+    }
+    const self = changes.find(change => pathKey(change.path) === pathKey(picked));
+    if (self?.movedTo) {
+      if (!pickedKeys.has(pathKey(self.movedTo))) deferred.push({ code: 'moved-to-target', target: self.movedTo });
+      continue;
+    }
+    // SVN status XML leaves kind unset for ordinary entries; only deleted and
+    // copied items learn it from svn info. Deleted directories may be gone from
+    // disk, so their kind is authoritative; live paths fall back to lstat.
+    const directory = expandDirectories && (self?.kind === 'dir'
+      || (self?.item !== 'deleted' && (await fs.lstat(picked).then(stat => stat.isDirectory()).catch(() => false))));
+    // A directory operation includes both the directory's own change (e.g. its
+    // property edit) and every descendant change, minus excluded ride-alongs.
+    const descendants = directory
+      ? changes.filter(change => within(picked, change.path)
+        && !deletedTreeRoot(change.path, changes)
+        && !change.movedTo)
+      : [];
+    const items = directory ? [...descendants, ...(self ? [self] : [])] : self ? [self] : [];
+    if (!items.length) continue; // No change at this path: callers decide whether that is an error.
+    for (const item of items) operations.set(pathKey(item.path), item);
+  }
+  reasons.push(...deferred.filter(reason => !operations.has(pathKey(reason.target))));
+  return { operations: [...operations.values()], reasons };
+}
+
 export class CommitSelection {
   private readonly files = new Map<string, string>();
   private readonly dependencies = new Map<string, string>();
