@@ -29,6 +29,21 @@ async function fixture(t) {
   return { root, wc, url, svn: (...args) => svn(wc, ...args) };
 }
 
+test('移动源不在管理范围内时 addMany 拒绝，不产生部分选择', async t => {
+  const f = await fixture(t);
+  // Source lies outside the managed scope: only the tree subdirectory is opened.
+  f.svn('move', '--', `${path.join(f.wc, 'main.js')}@`, 'tree/moved.js');
+  const scope = path.join(f.wc, 'tree');
+  const { all } = await status(scope);
+  const target = all.find(change => change.item === 'added' && change.movedFrom);
+  assert.ok(target, 'expected move target visible in scope status');
+  assert.equal(target.movedFrom, path.join(f.wc, 'main.js'));
+  const selection = new CommitSelection(f.wc);
+  selection.reconcile(all);
+  await assert.rejects(() => selection.addMany([target], [scope]), /移动源.*不在当前管理范围内/);
+  assert.equal(selection.size, 0);
+});
+
 async function status(wc) {
   const state = require('../dist/svn.js');
   const { changes, ancestors } = await state.readChanges(process.env.SVN_EXECUTABLE || 'svn', wc);

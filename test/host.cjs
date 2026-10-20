@@ -63,12 +63,15 @@ async function host(root, folder, settings = {}) {
   // SVN_TEST_INSTALLED_EXTENSIONS_DIR runs the installed VSIX from an isolated extensions
   // directory instead of the development build, so the installed package is what gets exercised.
   const installed = process.env.SVN_TEST_INSTALLED_EXTENSIONS_DIR;
-  const args = installed
-    ? [folder, '--new-window', `--user-data-dir=${profile}`, `--extensions-dir=${installed}`]
-    : [folder, '--new-window', '--disable-extensions', `--extensionDevelopmentPath=${path.resolve('.')}`,
-      `--user-data-dir=${profile}`, `--extensions-dir=${path.join(root, 'extensions')}`];
-  const child = spawn(executable, [...args, '--remote-debugging-port=0',
-    '--skip-welcome', '--skip-release-notes'], { windowsHide: true, stdio: 'ignore' });
+  const args = [
+    ...(installed ? [folder] : [folder, '--disable-extensions', `--extensionDevelopmentPath=${path.resolve('.')}`]),
+    `--user-data-dir=${profile}`, `--extensions-dir=${installed ?? path.join(root, 'extensions')}`,
+    // Shell environment resolution fails on this machine's spawned shell and its
+    // notification can steal focus from the quick input under test.
+    '--force-disable-user-env',
+    '--remote-debugging-port=0', '--skip-welcome', '--skip-release-notes'
+  ];
+  const child = spawn(executable, ['--new-window', ...args], { windowsHide: true, stdio: 'ignore' });
   let browser;
   try {
     let port;
@@ -108,8 +111,35 @@ async function host(root, folder, settings = {}) {
       },
       async chooseChange(title, name) {
         await this.command(title, false);
-        await page.locator('.quick-input-list .monaco-list-row').filter({ hasText: name }).first().click();
-        await page.locator('.quick-input-widget input:visible').first().waitFor({ state: 'hidden' });
+        const input = page.locator('.quick-input-widget input:visible').first();
+        // The pick list can open while the previous input is still animating out;
+        // retry once if the row is not rendered promptly.
+        const row = page.locator('.quick-input-list .monaco-list-row').filter({ hasText: name }).first();
+        try { await row.waitFor({ state: 'visible', timeout: 8000 }); }
+        catch {
+          await page.keyboard.press('Escape');
+          await input.waitFor({ state: 'hidden' }).catch(() => undefined);
+          await this.command(title, false);
+          await row.waitFor({ state: 'visible' });
+        }
+        // Multi-select rows carry a checkbox toggle. Clicking the row body
+        // toggles the checkbox but does not move the list's keyboard highlight,
+        // so a following Enter confirms whichever row is active instead. Toggle
+        // the checkbox directly and verify it is checked before confirming.
+        const toggle = row.locator('.monaco-custom-toggle[role=checkbox]').first();
+        if (await toggle.count()) {
+          if ((await toggle.getAttribute('aria-checked')) !== 'true') {
+            await toggle.click();
+          }
+          if ((await toggle.getAttribute('aria-checked')) !== 'true') {
+            throw new Error(`无法勾选待提交项 ${name}，快速选择状态异常。`);
+          }
+        }
+        await page.keyboard.press('Enter');
+        await input.waitFor({ state: 'hidden' });
+        // A multi-select confirm without any checked row closes silently; the
+        // caller would then operate on an empty change. Surface it immediately.
+        // (The picker is gone, so this only guards the selection outcome below.)
       },
       async commitMessage(message, index = 0) {
         await this.focus();

@@ -187,7 +187,7 @@ export function activate(context: vscode.ExtensionContext): void {
         const { operations } = await expand(view.changes.map(change => change.path), view.changes);
         const selectable = new Set(operations.map(operation => pathKey(operation.path)));
         const paths = (remove ? view.selected.explicitTargets : view.changes.map(change => change.path))
-          .filter(target => !view.selected.has(target) && (remove || selectable.has(pathKey(target))));
+          .filter(target => (remove ? view.selected.has(target) : !view.selected.has(target) && selectable.has(pathKey(target))));
         return paths.map(target => ({ label: path.basename(target), description: `${view.scm.rootUri!.fsPath} · ${path.relative(view.scm.rootUri!.fsPath, target)}`, view, target }));
       }));
       const choices = choiceGroups.flat();
